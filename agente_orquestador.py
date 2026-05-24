@@ -117,7 +117,7 @@ class AgenteOrquestador:
 
             ollama_response = requests.post("http://127.0.0.1:11434/api/generate", json=payload)
             ollama_response.raise_for_status()
-            
+
             json_response = ollama_response.json()
             router_decision = json_response['response'].strip()
 
@@ -131,7 +131,7 @@ class AgenteOrquestador:
             elif router_decision.startswith('EXEC -'):
                 payload = router_decision.split('-', 1)[1].strip()
                 context.user_data.pop('historial', None) # Limpiar historial para la próxima consulta
-                
+
                 # Extraer Ticker, Capital y Riesgo del payload
                 ticker_match = re.search(r'TICKER:\[([^\]]+)\]', payload)
                 capital_match = re.search(r'CAPITAL:\[([^\]]+)\]', payload)
@@ -140,13 +140,13 @@ class AgenteOrquestador:
                 ticker = ticker_match.group(1) if ticker_match else "N/A"
                 capital = capital_match.group(1) if capital_match else "N/A"
                 riesgo = riesgo_match.group(1) if riesgo_match else "N/A"
-                
+
                 await update.message.reply_text(f"¡Excelente! He reunido toda la información. Analizando {ticker}... un momento por favor.")
 
                 # --- MOCK: Llamadas a los otros agentes (que siguen usando Gemini) ---
                 logging.info(f"[MOCK] Llamando a AgenteTecnico con el payload: {payload}")
                 reporte_tecnico = f"Análisis Técnico (mock): Señal de COMPRA para {ticker} basada en RSI bajo y cruce de medias móviles."
-                
+
                 logging.info(f"[MOCK] Llamando a AgenteFundamental con el payload: {payload}")
                 reporte_fundamental = f"Análisis Fundamental (mock): Sentimiento POSITIVO para {ticker} por noticias de expansión de mercado."
                 # --- FIN DEL MOCK ---
