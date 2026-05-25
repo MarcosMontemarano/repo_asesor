@@ -29,9 +29,6 @@ logging.basicConfig(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CATÁLOGO DE ACTIVOS IOL
-# Principio: mínimo suficiente. No es una base de datos, es el vocabulario
-# del dominio. Le da al router la capacidad de mapear nombres naturales
-# ("YPF", "el petróleo argentino", "Coca Cola") a tickers exactos.
 # ──────────────────────────────────────────────────────────────────────────────
 IOL_CATALOG = """
 ACCIONES LOCALES (Bolsa Argentina):
@@ -60,71 +57,123 @@ CEDEARs (acciones extranjeras que cotizan en pesos en Argentina):
 BONOS SOBERANOS ARGENTINOS (renta fija en USD):
   AL30  = Bono vence 2030, legislación local
   AL35  = Bono vence 2035, legislación local
-  GD30  = Bono vence 2030, legislación Nueva York (más seguro para inversores)
+  GD30  = Bono vence 2030, legislación Nueva York (más seguro)
   GD35  = Bono vence 2035, legislación Nueva York
   ADVERTENCIA: AL30 y GD30 son BONOS SOBERANOS, NO acciones ni CEDEARs.
 
 PERFIL DE RIESGO POR CLASE DE ACTIVO:
-  Muy bajo  → Cauciones / FCI money market
-  Bajo      → Bonos (AL30, GD30)
-  Medio     → CEDEARs defensivos (KO, SPY)
-  Medio-Alto→ Acciones locales (GGAL, YPFD)
-  Alto      → CEDEARs growth (TSLA, NVDA)
+  Muy bajo   → Cauciones / FCI money market
+  Bajo       → Bonos (AL30, GD30)
+  Medio      → CEDEARs defensivos (KO, SPY)
+  Medio-Alto → Acciones locales (GGAL, YPFD, PAMP)
+  Alto       → CEDEARs growth (TSLA, NVDA)
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROMPT DEL ROUTER
+#
+# Decisiones de diseño:
+#   1. El HISTORIAL va PRIMERO. Llama 3.2 le da más peso al texto inicial.
+#   2. Ejemplos con PLACEHOLDERS, no texto literal copiable.
+#   3. Regla explícita: el ticker a ejecutar es SIEMPRE el último mencionado
+#      por el usuario, no el más frecuente en el historial.
+#   4. Solo "accion" sin tilde como clave JSON. Se refuerza con mayúsculas
+#      y ejemplo literal de la clave exacta.
 # ──────────────────────────────────────────────────────────────────────────────
-ROUTER_SYSTEM_PROMPT = f"""
-Eres el enrutador conversacional de AFMA, asesor financiero de IOL Argentina.
-Tu trabajo: mantener una conversación natural para obtener CAPITAL, RIESGO y
-un TICKER EXACTO, y devolver un JSON de acción.
-
+ROUTER_INSTRUCTIONS = f"""
 {IOL_CATALOG}
 
-CÓMO EXTRAER LOS DATOS:
-- CAPITAL: cualquier monto mencionado por el usuario.
-- RIESGO: bajo/medio/alto. Inferilo del contexto si no lo dice explícitamente.
-  "quiero algo seguro" = bajo. "no me importa arriesgar" = alto. Duda = medio.
-- TICKER: usá el catálogo para convertir nombres naturales a tickers exactos.
-  "YPF" = YPFD | "Apple" = AAPL | "bonos" genérico = preguntá cuál.
-  Si el usuario menciona varios activos, tomá el primero e informale que vas de a uno.
+═══════════════════════════════════════════
+ TU ROL
+═══════════════════════════════════════════
+Eres el enrutador de AFMA, asesor financiero de IOL Argentina.
+Leé el historial de arriba y extraé: CAPITAL, RIESGO y TICKER.
+Devolvé UN SOLO objeto JSON. Sin texto fuera del JSON.
+La clave de acción se escribe EXACTAMENTE así: "accion" (sin tilde, sin acento).
 
-LAS ÚNICAS DOS ACCIONES VÁLIDAS:
+═══════════════════════════════════════════
+ QUÉ ES UN TICKER
+═══════════════════════════════════════════
+Un ticker es el código corto con el que se identifica una empresa o activo
+en la bolsa. Por ejemplo: PAMP es el ticker de Pampa Energía, AAPL es el
+ticker de Apple, AL30 es el ticker de un bono soberano argentino.
+Cuando el usuario menciona una empresa por nombre, usá el catálogo para
+encontrar su ticker exacto. Cuando uses un ticker en tu mensaje, siempre
+aclará el nombre de la empresa entre paréntesis.
+Ejemplo correcto: "PAMP (Pampa Energía)" o "AAPL (Apple)".
 
-ACCION "CHAT" — cuando falta algún dato O el usuario pide recomendaciones/distribución.
-  - Respondé con lenguaje natural, cálido, directo. Nunca repetir recomendaciones ya dadas.
-  - Si pide distribución de capital entre varios activos, proponé el reparto y preguntá por cuál empezar.
-  Formato obligatorio: {{"accion": "CHAT", "mensaje": "<tu respuesta>"}}
+═══════════════════════════════════════════
+ EXTRACCIÓN DE DATOS
+═══════════════════════════════════════════
+CAPITAL : cualquier monto que mencione el usuario.
+RIESGO  : bajo / medio / alto.
+          Si no lo dice, inferilo del contexto.
+          "quiero algo seguro" = bajo.
+          "no me importa arriesgar" = alto.
+          Sin señal clara = medio.
+TICKER  : usá el catálogo para mapear nombres a tickers exactos.
+          "YPF" → YPFD | "Pampa" → PAMP | "Apple" → AAPL
+          "bonos" sin especificar → preguntá cuál.
 
-ACCION "EXEC" — solo cuando tenés CAPITAL + RIESGO + TICKER exacto confirmados.
-  Formato obligatorio: {{"accion": "EXEC", "ticker": "<TICKER>", "capital": "<capital>", "riesgo": "<riesgo>"}}
+REGLA CRÍTICA DE TICKER:
+  El ticker a usar en EXEC es SIEMPRE el último activo mencionado
+  explícitamente por el usuario en el historial, no el más frecuente
+  ni el primero que aparece. Si el usuario dice "analizá PAMP" después
+  de haber hablado de YPF, el ticker es PAMP.
 
-REGLAS CRÍTICAS:
-1. Solo JSON puro. Sin texto fuera del objeto JSON.
-2. Solo "CHAT" o "EXEC". NUNCA: BUSCAR, RECOMENDAR, ANALIZAR, DISTRIBUIR, etc.
-3. Nunca inventar tickers fuera del catálogo.
-4. Nunca confundir AL30/GD30 (bonos) con acciones o CEDEARs.
-5. Leer el historial completo antes de responder.
+  Si el usuario menciona varios activos a la vez, tomá el primero de esa
+  lista e informale que los analizás de a uno.
 
-EJEMPLOS:
+═══════════════════════════════════════════
+ ACCIONES VÁLIDAS — SOLO ESTAS DOS
+═══════════════════════════════════════════
+"CHAT" : cuando falta algún dato, el usuario pide recomendaciones,
+         o pide distribución de capital entre varios activos.
+         → Respondé basándote en el historial real, no en los ejemplos.
+         → Si pide distribución, proponé el reparto y preguntá por cuál empezar.
+         → NUNCA repitas información que ya está en el historial.
+         → NUNCA preguntes datos que el usuario ya dio en el historial.
+         → Al mencionar un ticker, siempre aclarás el nombre entre paréntesis.
+         Formato: {{"accion": "CHAT", "mensaje": "[respuesta personalizada]"}}
 
-Caso 1 — usuario da clase de activo sin ticker:
-  Historial: "Usuario: quiero invertir 100000 en CEDEARs con riesgo medio"
-  Respuesta: {{"accion": "CHAT", "mensaje": "Buena eleccion. Con $100.000 y riesgo medio te recomiendo:\\n- SPY: ETF del S&P500, maxima diversificacion en USA.\\n- KO (Coca-Cola): defensiva, dividendos estables, baja volatilidad.\\n- AAPL (Apple): tecnologia solida con crecimiento constante.\\n,Con cual empezamos?"}}
+"EXEC" : solo cuando tenés CAPITAL + RIESGO + TICKER confirmados.
+         Formato: {{"accion": "EXEC", "ticker": "[TICKER]", "capital": "[monto]", "riesgo": "[nivel]"}}
 
-Caso 2 — usuario pide distribucion entre varios activos:
-  Historial: "Usuario: quiero invertir en SPY, AAPL y YPF, como repartis 100000?"
-  Respuesta: {{"accion": "CHAT", "mensaje": "Con $100.000 y riesgo medio una distribucion equilibrada seria:\\n- SPY: 50% ($50.000) ancla del portafolio.\\n- AAPL: 30% ($30.000) tecnologia consolidada.\\n- YPFD: 20% ($20.000) apuesta al sector energetico argentino.\\nLos analisis son de a uno. Arrancamos por SPY?"}}
+PROHIBIDO inventar acciones como BUSCAR, RECOMENDAR, ANALIZAR, etc.
+PROHIBIDO usar "acción" con tilde. La clave es siempre "accion".
+PROHIBIDO inventar tickers que no estén en el catálogo.
+PROHIBIDO preguntar por datos que el usuario ya proporcionó.
 
-Caso 3 — usuario confirma ticker:
-  Historial: "[Asesor propuso SPY, KO, AAPL]\\nUsuario: analizá SPY"
-  Respuesta: {{"accion": "EXEC", "ticker": "SPY", "capital": "100000", "riesgo": "medio"}}
+═══════════════════════════════════════════
+ ESTRUCTURA DE EJEMPLOS
+═══════════════════════════════════════════
+Caso A — falta el ticker, el usuario pide ideas:
+  → {{"accion": "CHAT", "mensaje": "[Recomendás 3 tickers del catálogo con nombre entre paréntesis, adecuados al capital y riesgo mencionados en el historial. Preguntás cuál analizar primero.]"}}
 
-Caso 4 — usuario da todo junto con nombre de empresa:
-  Historial: "Usuario: quiero analizar YPF con 50000 pesos riesgo alto"
-  Respuesta: {{"accion": "EXEC", "ticker": "YPFD", "capital": "50000", "riesgo": "alto"}}
+Caso B — el usuario pide distribución entre varios activos:
+  → {{"accion": "CHAT", "mensaje": "[Proponés un reparto porcentual concreto para los activos que mencionó, con nombre entre paréntesis. Informás que los análisis son de a uno. Preguntás por cuál empezar.]"}}
+
+Caso C — el usuario confirma un ticker o nombra una empresa directamente:
+  → {{"accion": "EXEC", "ticker": "[ticker exacto del catálogo, el último mencionado por el usuario]", "capital": "[capital del historial]", "riesgo": "[riesgo del historial o inferido]"}}
+
+Caso D — el usuario da todo junto en un mensaje:
+  → {{"accion": "EXEC", "ticker": "[ticker mapeado desde el catálogo]", "capital": "[monto mencionado]", "riesgo": "[nivel mencionado o inferido]"}}
 """
+
+
+def _normalizar_clave_accion(datos: dict) -> dict:
+    """
+    Llama 3.2 a veces devuelve 'acción' con tilde en lugar de 'accion'.
+    Esta función busca la clave correcta con o sin tilde y la normaliza,
+    garantizando que el resto del código siempre lea 'accion'.
+    """
+    if "accion" not in datos:
+        for variante in ("acción", "Accion", "Acción", "ACTION", "action"):
+            if variante in datos:
+                datos["accion"] = datos.pop(variante)
+                logging.warning(f"Clave '{variante}' normalizada a 'accion'.")
+                break
+    return datos
 
 
 class AgenteOrquestador:
@@ -140,6 +189,10 @@ class AgenteOrquestador:
 
         self.application = ApplicationBuilder().token(telegram_token).build()
 
+        # Historial respaldado en la instancia, keyed por chat_id.
+        # Fuente de verdad independiente de context.user_data.
+        self._historiales: dict[int, list[str]] = {}
+
         try:
             self.genai_client = genai.Client(api_key=gemini_api_key)
             self.genai_model = "gemini-flash-latest"
@@ -150,19 +203,31 @@ class AgenteOrquestador:
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Helper: llamada a Ollama con degradación graceful
+    # Helper: llamada a Ollama
     # ──────────────────────────────────────────────────────────────────────────
-    def _llamar_ollama(self, historial: list) -> dict:
+    def _llamar_ollama(self, chat_id: int, historial: list[str]) -> dict:
         """
-        Llama al modelo local Ollama con el historial completo.
-        Garantiza que la respuesta sea siempre {"accion": "CHAT"|"EXEC", ...}
-        aunque el modelo devuelva una acción inventada.
+        Construye el prompt con el historial PRIMERO y las instrucciones DESPUÉS.
+        Trunca a los últimos 10 turnos para no exceder el contexto de Llama.
         """
+        historial_reciente = historial[-10:]
+
         full_prompt = (
-            ROUTER_SYSTEM_PROMPT
-            + "\n\nHISTORIAL DE CONVERSACION ACTUAL:\n"
-            + "\n".join(historial)
-            + "\n\nDevuelve tu respuesta JSON ahora:"
+            "═══════════════════════════════════════════\n"
+            " HISTORIAL DE CONVERSACIÓN ACTUAL\n"
+            "═══════════════════════════════════════════\n"
+            + "\n".join(historial_reciente)
+            + "\n\n"
+            + "═══════════════════════════════════════════\n"
+            " INSTRUCCIONES DEL SISTEMA\n"
+            "═══════════════════════════════════════════\n"
+            + ROUTER_INSTRUCTIONS
+            + "\n\nAnalizá el historial completo y devolvé tu respuesta JSON ahora:"
+        )
+
+        logging.info(
+            f"[chat_id={chat_id}] Llamando Ollama. "
+            f"Historial ({len(historial_reciente)} turnos): {historial_reciente}"
         )
 
         payload = {
@@ -176,24 +241,25 @@ class AgenteOrquestador:
         resp.raise_for_status()
 
         raw = resp.json()["response"].strip()
-        logging.info(f"RAW Ollama JSON: {raw}")
+        logging.info(f"[chat_id={chat_id}] RAW Ollama JSON: {raw}")
 
-        datos = json.loads(raw)  # JSONDecodeError se propaga al caller
+        datos = json.loads(raw)
+
+        # Fix: normalizar clave "acción" con tilde → "accion"
+        datos = _normalizar_clave_accion(datos)
 
         accion = str(datos.get("accion", "")).upper()
 
         if accion not in ("CHAT", "EXEC"):
             logging.warning(
-                f"Accion invalida '{accion}' del router. Degradando a CHAT. Payload: {datos}"
+                f"[chat_id={chat_id}] Acción inválida '{accion}'. "
+                f"Degradando a CHAT. Payload completo: {datos}"
             )
             mensaje_rescatado = (
                 datos.get("mensaje")
                 or datos.get("message")
                 or datos.get("respuesta")
-                or (
-                    "Entiendo lo que busca. Para analizar el activo, "
-                    "confirme el ticker exacto que quiere analizar primero."
-                )
+                or "Entiendo lo que buscás. ¿Me confirmás qué activo querés analizar primero?"
             )
             return {"accion": "CHAT", "mensaje": mensaje_rescatado}
 
@@ -204,63 +270,77 @@ class AgenteOrquestador:
     # Handlers de Telegram
     # ──────────────────────────────────────────────────────────────────────────
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
+        self._historiales[chat_id] = []
+        logging.info(f"[chat_id={chat_id}] Sesión iniciada con /start. Historial reseteado.")
+
         mensaje = (
-            "Hola! Soy AFMA, tu asesor financiero para IOL (InvertirOnline).\n\n"
+            "¡Hola! Soy AFMA, tu asesor financiero para IOL (InvertirOnline).\n\n"
             "Podés hablarme de forma natural. Por ejemplo:\n"
             "  \"Tengo $100.000 y quiero invertir en CEDEARs\"\n"
-            "  \"Qué bonos en dólares recomendás para riesgo bajo?\"\n"
+            "  \"¿Qué bonos en dólares recomendás para riesgo bajo?\"\n"
             "  \"Quiero analizar YPF con riesgo alto\"\n\n"
-            "En qué te ayudo hoy?"
+            "¿En qué te ayudo hoy?"
         )
         await update.message.reply_text(mensaje)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_chat.id
         texto_usuario = update.message.text
-        historial = context.user_data.get("historial", [])
+
+        historial = self._historiales.get(chat_id, [])
         historial.append(f"Usuario: {texto_usuario}")
 
         try:
-            datos_ia = self._llamar_ollama(historial)
+            datos_ia = self._llamar_ollama(chat_id, historial)
             accion = datos_ia["accion"]
 
-            # ── CASO CHAT: continuar conversación ─────────────────────────
+            # ── CASO CHAT ─────────────────────────────────────────────────
             if accion == "CHAT":
-                mensaje = datos_ia.get("mensaje", "Podés contarme más? Qué activo te interesa?")
+                mensaje = datos_ia.get("mensaje", "¿Podés contarme más? ¿Qué activo te interesa?")
                 historial.append(f"Asesor: {mensaje}")
-                context.user_data["historial"] = historial
+                self._historiales[chat_id] = historial
+                logging.info(
+                    f"[chat_id={chat_id}] CHAT respondido. "
+                    f"Historial ahora tiene {len(historial)} entradas."
+                )
                 await update.message.reply_text(mensaje)
 
-            # ── CASO EXEC: lanzar análisis completo ───────────────────────
+            # ── CASO EXEC ─────────────────────────────────────────────────
             elif accion == "EXEC":
                 ticker  = datos_ia.get("ticker", "").upper()
-                capital = datos_ia.get("capital", "")
+                capital = str(datos_ia.get("capital", ""))
                 riesgo  = datos_ia.get("riesgo", "")
 
                 if not all([ticker, capital, riesgo]):
-                    logging.error(f"EXEC con campos vacios: {datos_ia}")
+                    logging.error(f"[chat_id={chat_id}] EXEC con campos vacíos: {datos_ia}")
                     historial.append("Asesor: [error interno — datos incompletos]")
-                    context.user_data["historial"] = historial
+                    self._historiales[chat_id] = historial
                     await update.message.reply_text(
-                        "Casi llegamos, pero me faltó un dato. "
-                        "Confirmame el ticker, capital y nivel de riesgo."
+                        "Casi llegamos, pero me faltó algún dato. "
+                        "¿Me confirmás el ticker, capital y nivel de riesgo?"
                     )
                     return
 
-                context.user_data.pop("historial", None)
+                self._historiales[chat_id] = []
+                logging.info(
+                    f"[chat_id={chat_id}] EXEC disparado: {ticker} | {capital} | {riesgo}. "
+                    "Historial reseteado."
+                )
 
                 await update.message.reply_text(
-                    f"Analizando {ticker} — capital ${capital}, riesgo {riesgo}... un momento"
+                    f"Analizando {ticker} — capital ${capital}, riesgo {riesgo}... un momento 🔍"
                 )
 
                 # ── MOCK agentes especializados ────────────────────────────
                 # TODO: reemplazar por instancias reales de AgenteTecnico y AgenteFundamental
                 payload_str = f"TICKER:{ticker}|CAPITAL:{capital}|RIESGO:{riesgo}"
-                logging.info(f"[MOCK] AgenteTecnico  -> {payload_str}")
+                logging.info(f"[MOCK] AgenteTecnico  → {payload_str}")
                 reporte_tecnico = (
                     f"Señal COMPRA para {ticker}: RSI 38 (sobreventa), "
                     "cruce alcista SMA10/SMA20, volumen sobre promedio 10d."
                 )
-                logging.info(f"[MOCK] AgenteFundamental -> {payload_str}")
+                logging.info(f"[MOCK] AgenteFundamental → {payload_str}")
                 reporte_fundamental = (
                     f"Sentimiento POSITIVO para {ticker}: noticias de expansión "
                     "y resultados trimestrales sobre estimaciones."
@@ -268,7 +348,7 @@ class AgenteOrquestador:
                 # ── FIN MOCK ───────────────────────────────────────────────
 
                 prompt_final = (
-                    f"Eres el Asesor Financiero final de IOL. Cliente amateur. "
+                    f"Eres el Asesor Financiero final de IOL. Cliente amateur.\n"
                     f"Activo: {ticker} | Capital: ${capital} | Riesgo: {riesgo}\n\n"
                     f"Análisis Técnico: {reporte_tecnico}\n"
                     f"Análisis Fundamental: {reporte_fundamental}\n\n"
@@ -286,26 +366,26 @@ class AgenteOrquestador:
                 await update.message.reply_text(response.text.strip())
 
         except requests.exceptions.ConnectionError:
-            logging.error("No se pudo conectar con Ollama en http://127.0.0.1:11434")
-            context.user_data.pop("historial", None)
+            logging.error(f"[chat_id={chat_id}] No se pudo conectar con Ollama.")
+            self._historiales.pop(chat_id, None)
             await update.message.reply_text(
-                "El motor de IA local no esta disponible ahora mismo. "
-                "Por favor contacta al administrador."
+                "⚠️ El motor de IA local no está disponible ahora mismo. "
+                "Por favor, contactá al administrador."
             )
 
         except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError del router Ollama: {e}", exc_info=True)
-            context.user_data.pop("historial", None)
+            logging.error(f"[chat_id={chat_id}] JSONDecodeError de Ollama: {e}", exc_info=True)
+            self._historiales.pop(chat_id, None)
             await update.message.reply_text(
                 "Tuve un problema procesando tu mensaje. "
-                "Podemos empezar de nuevo? Contame que activo te interesa."
+                "¿Podemos empezar de nuevo? Contame qué activo te interesa."
             )
 
         except Exception as e:
-            logging.error(f"Error inesperado: {e}", exc_info=True)
-            context.user_data.pop("historial", None)
+            logging.error(f"[chat_id={chat_id}] Error inesperado: {e}", exc_info=True)
+            self._historiales.pop(chat_id, None)
             await update.message.reply_text(
-                "Ocurrio un error inesperado. Intentá de nuevo en unos segundos."
+                "Ocurrió un error inesperado. Intentá de nuevo en unos segundos."
             )
 
     def run(self):
@@ -318,10 +398,10 @@ if __name__ == "__main__":
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
     if not TELEGRAM_TOKEN:
-        logging.error("TELEGRAM_TOKEN no configurado. Revisa tu .env")
+        logging.error("TELEGRAM_TOKEN no configurado. Revisá tu .env")
         sys.exit(1)
     if not GEMINI_API_KEY:
-        logging.error("GEMINI_API_KEY no configurado. Revisa tu .env")
+        logging.error("GEMINI_API_KEY no configurado. Revisá tu .env")
         sys.exit(1)
 
     try:
