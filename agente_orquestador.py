@@ -20,6 +20,7 @@ import os
 import sys
 import logging
 import re
+import json
 import requests
 import google.genai as genai
 from dotenv import load_dotenv
@@ -65,12 +66,7 @@ class AgenteOrquestador:
                 'capital a usar. Propón siempre una estrategia clara.'
             )
             # System prompt para el router conversacional
-            self.router_system_prompt = (
-                '<rol>Eres el enrutador de un asesor financiero de IOL en Argentina. Tu único objetivo es extraer 3 variables del usuario: CAPITAL, RIESGO y TICKER.</rol> <reglas>\n\n'
-                "    Si falta CAPITAL o RIESGO: Devuelve EXACTAMENTE la palabra 'CHAT - ' seguida de una pregunta breve para averiguar el dato faltante.\n"
-                "    Si tienes CAPITAL y RIESGO, pero falta TICKER: Devuelve EXACTAMENTE 'CHAT - ' seguido de 3 opciones de activos reales en IOL (ej. CEDEARs como SPY/KO, o Bonos como AL30) acordes a su perfil, y pregúntale cuál elige.\n"
-                "    Si tienes los 3 datos confirmados: Devuelve ÚNICAMENTE 'EXEC - TICKER:[ticker]|CAPITAL:[capital]|RIESGO:[riesgo]'."
-            )
+            self.router_system_prompt = ('Eres el enrutador de un asesor financiero de IOL. Tu objetivo es obtener CAPITAL, RIESGO y un TICKER ESPECÍFICO. CONTEXTO FINANCIERO DE IOL: IOL opera Acciones locales (ej. GGAL, YPFD), CEDEARs (ej. SPY, AAPL, KO), Bonos (ej. AL30, GD30), Cauciones, Fondos Comunes de Inversión (FCI) y Obligaciones Negociables. REGLA VITAL INQUEBRANTABLE: Palabras como CEDEAR, Bono, Caución, FCI o Acción NO son tickers, son clases de activos. Un ticker es un símbolo de mercado exacto (ej. SPY, AAPL, AL30). Si el usuario menciona una clase de activo pero no un ticker exacto, NO tienes el ticker. En ese caso, asume tu rol de asesor financiero de IOL y redacta tú mismo un mensaje natural recomendando 3 tickers reales de esa clase de activo, explicando brevemente y con tus palabras por qué son una buena opción para su capital y riesgo, y pregúntale cuál quiere analizar. Tu respuesta debe ser ÚNICAMENTE un objeto JSON. Devuelve: {"accion": "CHAT", "mensaje": "[escribe tu mensaje persuasivo y natural aquí]"}. Si tienes los 3 datos exactos confirmados, devuelve {"accion": "EXEC", "ticker": "[ticker]", "capital": "[capital]", "riesgo": "[riesgo]"}.')
             # La instanciación del modelo con memoria (chat) se hará por usuario
             # en handle_message para evitar el uso de la clase obsoleta GenerativeModel.
         except Exception as e:
@@ -112,61 +108,66 @@ class AgenteOrquestador:
             payload = {
                 "model": "llama3.2",
                 "prompt": full_prompt,
-                "stream": False
+                "stream": False,
+                "format": "json"
             }
 
             ollama_response = requests.post("http://127.0.0.1:11434/api/generate", json=payload)
             ollama_response.raise_for_status()
 
             json_response = ollama_response.json()
-            router_decision = json_response['response'].strip()
+            respuesta_ia_str = json_response['response'].strip()
+            logging.info(f"RAW IA JSON string: {respuesta_ia_str}")
 
-            # Lógica de enrutamiento
-            if router_decision.startswith('CHAT -'):
-                respuesta_chat = router_decision.split('-', 1)[1].strip()
-                historial.append(f"Asesor: {respuesta_chat}")
-                context.user_data['historial'] = historial
-                await update.message.reply_text(respuesta_chat)
+            try:
+                datos_ia = json.loads(respuesta_ia_str)
+                accion = datos_ia.get("accion")
 
-            elif router_decision.startswith('EXEC -'):
-                payload = router_decision.split('-', 1)[1].strip()
-                context.user_data.pop('historial', None) # Limpiar historial para la próxima consulta
+                if accion == "CHAT":
+                    mensaje = datos_ia.get("mensaje", "No sé qué decir. ¿Podemos intentarlo de nuevo?")
+                    historial.append(f"Asesor: {mensaje}")
+                    context.user_data['historial'] = historial
+                    await update.message.reply_text(mensaje)
 
-                # Extraer Ticker, Capital y Riesgo del payload
-                ticker_match = re.search(r'TICKER:\[([^\]]+)\]', payload)
-                capital_match = re.search(r'CAPITAL:\[([^\]]+)\]', payload)
-                riesgo_match = re.search(r'RIESGO:\[([^\]]+)\]', payload)
+                elif accion == "EXEC":
+                    ticker = datos_ia.get("ticker")
+                    capital = datos_ia.get("capital")
+                    riesgo = datos_ia.get("riesgo")
 
-                ticker = ticker_match.group(1) if ticker_match else "N/A"
-                capital = capital_match.group(1) if capital_match else "N/A"
-                riesgo = riesgo_match.group(1) if riesgo_match else "N/A"
+                    if not all([ticker, capital, riesgo]):
+                        raise ValueError(f"Faltan datos en la respuesta EXEC del JSON: {datos_ia}")
+                    
+                    context.user_data.pop('historial', None) # Limpiar historial para la próxima consulta
 
-                await update.message.reply_text(f"¡Excelente! He reunido toda la información. Analizando {ticker}... un momento por favor.")
+                    await update.message.reply_text(f"¡Excelente! He reunido toda la información. Analizando {ticker}... un momento por favor.")
 
-                # --- MOCK: Llamadas a los otros agentes (que siguen usando Gemini) ---
-                logging.info(f"[MOCK] Llamando a AgenteTecnico con el payload: {payload}")
-                reporte_tecnico = f"Análisis Técnico (mock): Señal de COMPRA para {ticker} basada en RSI bajo y cruce de medias móviles."
+                    # --- MOCK: Llamadas a los otros agentes (que siguen usando Gemini) ---
+                    payload_str = f"TICKER:{ticker}|CAPITAL:{capital}|RIESGO:{riesgo}"
+                    logging.info(f"[MOCK] Llamando a AgenteTecnico con el payload: {payload_str}")
+                    reporte_tecnico = f"Análisis Técnico (mock): Señal de COMPRA para {ticker} basada en RSI bajo y cruce de medias móviles."
 
-                logging.info(f"[MOCK] Llamando a AgenteFundamental con el payload: {payload}")
-                reporte_fundamental = f"Análisis Fundamental (mock): Sentimiento POSITIVO para {ticker} por noticias de expansión de mercado."
-                # --- FIN DEL MOCK ---
+                    logging.info(f"[MOCK] Llamando a AgenteFundamental con el payload: {payload_str}")
+                    reporte_fundamental = f"Análisis Fundamental (mock): Sentimiento POSITIVO para {ticker} por noticias de expansión de mercado."
+                    # --- FIN DEL MOCK ---
 
-                # Nuevo prompt final, ultra-corto y estructurado
-                prompt_final = (
-                    f"Eres el Asesor Financiero final de IOL. Tu cliente es amateur. Aquí tienes los análisis del activo {ticker}: "
-                    f"Técnico: {reporte_tecnico} Fundamental: {reporte_fundamental} Capital: {capital} | Riesgo: {riesgo}\n"
-                    "Tu regla inquebrantable: Sintetiza la decisión sin usar jerga compleja. Debes cruzar los datos y devolver EXACTAMENTE este formato y nada más:\n"
-                    "Veredicto: [COMPRAR / VENDER / RETENER] [Cantidad aproximada de nominales a operar basándote en el capital]. "
-                    "Explicaciones breves: [Máximo 2 líneas resumiendo el motivo de la decisión de forma muy simple y directa].\n"
-                    "¿Querés que profundice en algún detalle técnico o fundamental, o procedemos a ver otra opción?"
-                )
+                    prompt_final = (
+                        f"Eres el Asesor Financiero final de IOL. Tu cliente es amateur. Aquí tienes los análisis del activo {ticker}: "
+                        f"Técnico: {reporte_tecnico} Fundamental: {reporte_fundamental} Capital: {capital} | Riesgo: {riesgo}\n"
+                        "Tu regla inquebrantable: Sintetiza la decisión sin usar jerga compleja. Debes cruzar los datos y devolver EXACTAMENTE este formato y nada más:\n"
+                        "Veredicto: [COMPRAR / VENDER / RETENER] [Cantidad aproximada de nominales a operar basándote en el capital]. "
+                        "Explicaciones breves: [Máximo 2 líneas resumiendo el motivo de la decisión de forma muy simple y directa].\n"
+                        "¿Querés que profundice en algún detalle técnico o fundamental, o procedemos a ver otra opción?"
+                    )
 
-                # Llamada al modelo de IA de Gemini para la recomendación final
-                response = self.genai_client.models.generate_content(model=self.genai_model,
-                                                                     contents=[prompt_final])
-                await update.message.reply_text(response.text.strip())
-            else:
-                context.user_data.pop('historial', None) # Limpiar sesión si la respuesta es inesperada
+                    response = self.genai_client.models.generate_content(model=self.genai_model, contents=[prompt_final])
+                    await update.message.reply_text(response.text.strip())
+                else:
+                    # Esto maneja casos donde 'accion' está ausente o tiene un valor desconocido
+                    raise ValueError(f"Acción desconocida o faltante en la respuesta JSON: {accion}")
+
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                logging.error(f"Error al procesar la respuesta JSON del router: {e}. Respuesta recibida: '{respuesta_ia_str}'")
+                context.user_data.pop('historial', None) # Limpiar sesión
                 await update.message.reply_text("No estoy seguro de cómo proceder. ¿Podemos empezar de nuevo? Por favor, dime qué activo te interesa.")
 
         except requests.exceptions.ConnectionError:
