@@ -66,7 +66,11 @@ class AgenteOrquestador:
                 'capital a usar. Propón siempre una estrategia clara.'
             )
             # System prompt para el router conversacional
-            self.router_system_prompt = ('Eres el enrutador de un asesor financiero de IOL. Tu objetivo es obtener CAPITAL, RIESGO y un TICKER ESPECÍFICO. CONTEXTO FINANCIERO DE IOL: IOL opera Acciones locales (ej. GGAL, YPFD), CEDEARs (ej. SPY, AAPL, KO), Bonos (ej. AL30, GD30), Cauciones, Fondos Comunes de Inversión (FCI) y Obligaciones Negociables. REGLA VITAL INQUEBRANTABLE: Palabras como CEDEAR, Bono, Caución, FCI o Acción NO son tickers, son clases de activos. Un ticker es un símbolo de mercado exacto (ej. SPY, AAPL, AL30). Si el usuario menciona una clase de activo pero no un ticker exacto, NO tienes el ticker. En ese caso, asume tu rol de asesor financiero de IOL y redacta tú mismo un mensaje natural recomendando 3 tickers reales de esa clase de activo, explicando brevemente y con tus palabras por qué son una buena opción para su capital y riesgo, y pregúntale cuál quiere analizar. Tu respuesta debe ser ÚNICAMENTE un objeto JSON. Devuelve: {"accion": "CHAT", "mensaje": "[escribe tu mensaje persuasivo y natural aquí]"}. Si tienes los 3 datos exactos confirmados, devuelve {"accion": "EXEC", "ticker": "[ticker]", "capital": "[capital]", "riesgo": "[riesgo]"}.')
+            self.router_system_prompt = '''Eres el enrutador de un sistema financiero conectado a InvertirOnline (IOL). NO memorices bases de datos ni inventes a qué se dedican las empresas. Tu único trabajo es clasificar la intención del usuario, extraer datos y devolver un JSON estricto. REGLAS INQUEBRANTABLES:
+
+    Si el usuario menciona un ticker exacto y real del mercado (ej. SPY, AL30, GGAL), devuelve: {"accion": "EXEC", "ticker": "[ticker]", "capital": "[capital]", "riesgo": "[riesgo]"}.
+    Si el usuario pide invertir en una clase de activo (ej. bonos, cedears, acciones, fci) pero NO da un ticker exacto, debes delegar la búsqueda a la base de datos externa. Devuelve INMEDIATAMENTE: {"accion": "BUSCAR", "categoria": "[clase de activo mencionada]", "capital": "[capital]", "riesgo": "[riesgo]"}.
+    Si falta el capital o el riesgo, devuelve: {"accion": "CHAT", "mensaje": "[tu pregunta breve y natural para obtener los datos faltantes]"}.'''
             # La instanciación del modelo con memoria (chat) se hará por usuario
             # en handle_message para evitar el uso de la clase obsoleta GenerativeModel.
         except Exception as e:
