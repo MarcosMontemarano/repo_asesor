@@ -45,6 +45,7 @@ class AgenteFundamental:
         try:
             self.client = genai.Client(api_key=api_key)
             self.model_name = "gemini-flash-latest"
+            
             # Prompt para análisis fundamental de un activo específico
             self.system_prompt_template = (
                 "Eres un analista fundamental financiero experto. Lee los siguientes "
@@ -54,22 +55,30 @@ class AgenteFundamental:
                 "nombre de su empresa matriz, DEBES clasificar la fuente obligatoriamente "
                 "como IRRELEVANTE. Está totalmente PROHIBIDO basar tu CONCLUSIÓN final en "
                 "fuentes irrelevantes.\n\n"
+                "REGLA DE PROYECCIÓN ESTRATÉGICA: Es tu obligación identificar si el contexto está "
+                "influenciado por eventos globales o macroeconómicos futuros próximos (ej. el inminente "
+                "Mundial de fútbol, elecciones, anuncios de tasas). Debes evaluar cómo ese evento "
+                "impactará en el modelo de negocio de {simbolo}.\n\n"
                 "Tu respuesta debe tener este formato exacto:\n"
                 "    Enumera cada noticia de forma muy breve e indica si su índole es "
                 "POSITIVA, NEGATIVA, NEUTRAL o IRRELEVANTE. (Ej: - Fuente 1: [Breve título/resumen] "
                 "-> Índole: Positiva).\n"
                 "    Al final, deja un renglón en blanco y escribe la palabra CONCLUSIÓN: "
                 "seguida de tu veredicto final (POSITIVO, NEGATIVO o NEUTRAL) y "
-                "justifica en máximo 2 líneas por qué."
+                "justifica en máximo 3 líneas por qué, utilizando tu proyección estratégica."
             )
+            
             # Prompt para análisis macroeconómico usando el proxy ARGT
             self.proxy_system_prompt = (
                 "Eres un analista macroeconómico experto. El usuario quiere invertir en "
                 "renta fija local/bonos, por lo que te proveo noticias recientes del ETF "
-                "de Argentina (ARGT) como proxy del contexto país. Basado en estas noticias, "
-                "define si el sentimiento macroeconómico es POSITIVO, NEGATIVO o NEUTRAL. "
+                "de Argentina (ARGT) como proxy del contexto país.\n\n"
+                "REGLA DE PROYECCIÓN ESTRATÉGICA: Identifica en las noticias la influencia de "
+                "eventos globales o macroeconómicos futuros próximos (ej. elecciones, el Mundial, "
+                "decisiones del FMI). Evalúa cómo impactarán en el riesgo país y en los bonos locales.\n\n"
+                "Basado en esto, define si el sentimiento macroeconómico es POSITIVO, NEGATIVO o NEUTRAL. "
                 "Enumera 3 fuentes brevemente y termina con un renglón en blanco seguido "
-                "de la palabra CONCLUSIÓN: tu veredicto y 2 líneas de justificación."
+                "de la palabra CONCLUSIÓN: tu veredicto y 3 líneas de justificación estratégica."
             )
         except Exception as e:
             raise RuntimeError(f"Error al configurar el cliente de IA de Gemini: {e}") from e
