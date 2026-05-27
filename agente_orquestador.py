@@ -70,6 +70,25 @@ PERFIL DE RIESGO POR CLASE DE ACTIVO:
   Alto       → CEDEARs growth (TSLA, NVDA)
 """
 
+# ──────────────────────────────────────────────────────────────────────────────
+# PROMPT DEL ROUTER
+#
+# Cambios respecto a la versión anterior:
+#
+#   Patrón 1 — Llama inventa RECOMENDAR/ANALIZAR cuando tiene "suficiente info":
+#     Solución: regla positiva explícita — si el usuario menciona MÁS DE UN
+#     activo, la acción es SIEMPRE CHAT sin excepción. EXEC solo para uno.
+#
+#   Patrón 2 — Nombre largo de empresa (Pampa Energía, ETF del Nasdaq) no
+#     dispara EXEC aunque el modelo conozca el ticker:
+#     Solución: regla explícita — si en tu respuesta ibas a escribir un ticker
+#     concreto del catálogo y tenés capital y riesgo, eso es EXEC, no CHAT.
+#     + Ejemplos de mapeo nombre→ticker para los casos que fallaron.
+#
+#   Patrón 3 — JSON vacío {}:
+#     Solución: en Python (_normalizar_claves y chequeo de dict vacío).
+#     En el prompt: se refuerza que la respuesta SIEMPRE debe tener "accion".
+# ──────────────────────────────────────────────────────────────────────────────
 ROUTER_INSTRUCTIONS = f"""
 {IOL_CATALOG}
 
@@ -77,132 +96,105 @@ ROUTER_INSTRUCTIONS = f"""
  TU ROL
 ═══════════════════════════════════════════
 Eres el enrutador de AFMA, asesor financiero de IOL Argentina.
-Leé el historial de arriba y extraé: CAPITAL, RIESGO y TICKER.
+Leé el mensaje del usuario y extraé: CAPITAL, RIESGO y TICKER.
 Devolvé UN SOLO objeto JSON. Sin texto fuera del JSON.
+La respuesta SIEMPRE debe contener la clave "accion". Nunca devuelvas {{}}.
 La clave de acción se escribe EXACTAMENTE así: "accion" (sin tilde).
 La clave del ticker se escribe EXACTAMENTE así: "ticker" (sin e al final).
 
 ═══════════════════════════════════════════
  QUÉ ES UN TICKER
 ═══════════════════════════════════════════
-Un ticker es el código corto con el que se identifica una empresa o activo
-en la bolsa. Por ejemplo: PAMP es el ticker de Pampa Energía, AAPL es el
-ticker de Apple, AL30 es el ticker de un bono soberano argentino.
-Cuando el usuario menciona una empresa por nombre, usá el catálogo para
-encontrar su ticker exacto. Cuando uses un ticker en tu mensaje al usuario,
-siempre aclarás el nombre de la empresa entre paréntesis.
-Ejemplo correcto: "PAMP (Pampa Energía)" o "AAPL (Apple)".
+Un ticker es el código corto de un activo en la bolsa.
+Cuando uses un ticker en tu mensaje, aclarás el nombre entre paréntesis.
+Ejemplos de mapeo nombre → ticker:
+  "YPF" o "YPF S.A."        → YPFD
+  "Pampa" o "Pampa Energía" → PAMP
+  "Google" o "Alphabet"     → GOOGL
+  "MercadoLibre"            → MELI
+  "ETF del Nasdaq"          → QQQ
+  "ETF del S&P" o "S&P500"  → SPY
+  "Galicia"                 → GGAL
 
 ═══════════════════════════════════════════
  EXTRACCIÓN DE DATOS
 ═══════════════════════════════════════════
-CAPITAL : un número. Solo dígitos, sin letras ni nombres de empresas.
-          Si el usuario NO mencionó un monto, el campo capital va vacío: "".
-          NUNCA pongas el nombre de un activo en el campo capital.
-RIESGO  : bajo / medio / alto.
-          Si no lo dice, inferilo del contexto.
-          Sin señal clara = medio.
-TICKER  : usá el catálogo para mapear nombres a tickers exactos.
-          "YPF" → YPFD | "Pampa" → PAMP | "Apple" → AAPL
-          "bonos" sin especificar → preguntá cuál en un mensaje CHAT.
+CAPITAL : un número. Solo dígitos. NUNCA nombres de empresas en capital.
+          Si no hay monto, capital va vacío: "".
+RIESGO  : bajo / medio / alto. Sin señal clara = medio.
+TICKER  : usá el catálogo y la tabla de mapeo de arriba.
+          Si menciona varios activos → CHAT (ver regla crítica abajo).
 
-REGLA CRÍTICA DE TICKER:
-  El ticker a usar en EXEC es SIEMPRE el último activo mencionado
-  explícitamente por el usuario, no el más frecuente ni el primero.
+═══════════════════════════════════════════
+ REGLAS CRÍTICAS — LEER ANTES DE RESPONDER
+═══════════════════════════════════════════
+REGLA 1 — UN SOLO ACTIVO PARA EXEC:
+  Si el usuario menciona MÁS DE UN activo en el mismo mensaje,
+  la acción es SIEMPRE CHAT. Nunca EXEC con múltiples tickers.
+  Ejemplo: "SPY y AAPL con 100000" → CHAT, no EXEC.
+
+REGLA 2 — NOMBRE DE EMPRESA CON CAPITAL Y RIESGO ES EXEC:
+  Si el usuario nombra UNA empresa o producto financiero (aunque use el
+  nombre largo), y tenés capital y riesgo → la acción es EXEC con el
+  ticker mapeado del catálogo.
+  Ejemplo: "analizá Pampa Energía con 60000 riesgo alto" → EXEC ticker=PAMP
+  Ejemplo: "el ETF del Nasdaq con 30000 riesgo medio"   → EXEC ticker=QQQ
+  Ejemplo: "analizá Google con 120000 riesgo alto"       → EXEC ticker=GOOGL
+
+REGLA 3 — JSON NUNCA VACÍO:
+  La respuesta siempre tiene "accion". Si no sabés qué hacer, usá CHAT
+  con un mensaje pidiendo más información.
 
 ═══════════════════════════════════════════
  ACCIONES VÁLIDAS — SOLO ESTAS DOS
 ═══════════════════════════════════════════
-"CHAT" : cuando falta CAPITAL, RIESGO o TICKER, o el usuario pide
-         recomendaciones o distribución de capital.
-         → Respondé basándote en el historial real.
-         → Si falta el capital, pedilo específicamente.
-         → Si falta el ticker, recomendá opciones y preguntá cuál.
-         → NUNCA repitas información ya dada en el historial.
-         → NUNCA preguntes datos que el usuario ya dio.
-         → Al mencionar tickers, siempre aclarás el nombre entre paréntesis.
-         Formato: {{"accion": "CHAT", "mensaje": "[respuesta personalizada]"}}
+"CHAT" : cuando falta CAPITAL, RIESGO o TICKER, o el usuario menciona
+         múltiples activos, pide distribución, planes, gráficos, noticias,
+         preguntas de seguimiento o cualquier cosa fuera del análisis puntual.
+         Formato: {{"accion": "CHAT", "mensaje": "[respuesta breve]"}}
 
-"EXEC" : solo cuando tenés CAPITAL (número) + RIESGO + TICKER confirmados.
+"EXEC" : solo cuando tenés UN ticker + CAPITAL (número) + RIESGO confirmados.
          Formato: {{"accion": "EXEC", "ticker": "[TICKER]", "capital": "[número]", "riesgo": "[nivel]"}}
 
-PROHIBIDO: acciones como BUSCAR, RECOMENDAR, ANALIZAR, etc.
-PROHIBIDO: usar "acción" con tilde. La clave es siempre "accion".
-PROHIBIDO: usar "ticket". La clave es siempre "ticker".
-PROHIBIDO: poner nombres de empresas o tickers en el campo "capital".
-PROHIBIDO: inventar tickers fuera del catálogo.
-PROHIBIDO: preguntar datos que el usuario ya dio en el historial.
-
-═══════════════════════════════════════════
- ESTRUCTURA DE EJEMPLOS
-═══════════════════════════════════════════
-Caso A — falta el ticker:
-  → {{"accion": "CHAT", "mensaje": "[Recomendás 3 tickers con nombre entre paréntesis, adecuados al capital y riesgo del historial. Preguntás cuál analizar primero.]"}}
-
-Caso B — falta el capital:
-  → {{"accion": "CHAT", "mensaje": "[Le decís que tenés el ticker y el riesgo, solo falta saber con cuánto capital cuenta.]"}}
-
-Caso C — falta el riesgo:
-  → {{"accion": "CHAT", "mensaje": "[Le preguntás si prefiere riesgo bajo, medio o alto.]"}}
-
-Caso D — el usuario pide distribución entre varios activos:
-  → {{"accion": "CHAT", "mensaje": "[Proponés un reparto porcentual concreto con nombres entre paréntesis. Informás que los análisis son de a uno. Preguntás por cuál empezar.]"}}
-
-Caso E — el usuario confirma un ticker o da todo junto:
-  → {{"accion": "EXEC", "ticker": "[ticker exacto del catálogo]", "capital": "[número]", "riesgo": "[nivel]"}}
+PROHIBIDO: RECOMENDAR, ANALIZAR, BUSCAR, DISTRIBUIR, o cualquier otra acción.
+PROHIBIDO: "acción" con tilde. Siempre "accion".
+PROHIBIDO: "ticket". Siempre "ticker".
+PROHIBIDO: nombres de empresas en el campo capital.
+PROHIBIDO: EXEC con múltiples tickers.
+PROHIBIDO: devolver JSON vacío {{}}.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers de normalización del JSON de Ollama
-# Llama 3.2 produce typos previsibles. Los corregimos en Python, no en el prompt,
-# porque el prompt ya es suficientemente largo y los modelos pequeños
-# no siempre respetan restricciones tipográficas con consistencia.
+# Helpers de normalización y validación
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _normalizar_claves(datos: dict) -> dict:
-    """
-    Corrige typos conocidos en las claves del JSON de Ollama:
-      - "acción" / "Accion" / "ACTION" → "accion"
-      - "ticket" / "Ticker" / "TICKER" → "ticker"
-    """
-    # Normalizar clave de acción
+    """Corrige typos conocidos en claves del JSON de Ollama."""
     if "accion" not in datos:
         for variante in ("acción", "Accion", "Acción", "ACTION", "action"):
             if variante in datos:
                 datos["accion"] = datos.pop(variante)
                 logging.warning(f"Clave '{variante}' normalizada a 'accion'.")
                 break
-
-    # Normalizar clave de ticker
     if "ticker" not in datos:
         for variante in ("ticket", "Ticker", "TICKER", "tiker"):
             if variante in datos:
                 datos["ticker"] = datos.pop(variante)
                 logging.warning(f"Clave '{variante}' normalizada a 'ticker'.")
                 break
-
     return datos
 
 
 def _extraer_numero(valor) -> str:
-    """
-    Recibe el valor del campo 'capital' y devuelve solo dígitos.
-    Si el valor es numérico, lo convierte a string limpio.
-    Si es un string con letras (ej: "YPF", "100k"), extrae solo los dígitos.
-    Si no hay dígitos, devuelve cadena vacía.
-    """
+    """Extrae solo dígitos del campo capital. Devuelve '' si no hay número."""
     if valor is None:
         return ""
-    texto = str(valor)
-    solo_digitos = re.sub(r"[^\d]", "", texto)
+    solo_digitos = re.sub(r"[^\d]", "", str(valor))
     return solo_digitos
 
 
 def _validar_exec(datos: dict) -> tuple[bool, str]:
-    """
-    Valida que un dict EXEC tenga ticker, capital numérico y riesgo.
-    Devuelve (es_valido, mensaje_de_error).
-    """
+    """Valida que EXEC tenga ticker, capital numérico y riesgo."""
     ticker  = datos.get("ticker", "").strip().upper()
     capital = _extraer_numero(datos.get("capital", ""))
     riesgo  = str(datos.get("riesgo", "")).strip()
@@ -245,6 +237,10 @@ class AgenteOrquestador:
     # Helper: llamada a Ollama
     # ──────────────────────────────────────────────────────────────────────────
     def _llamar_ollama(self, chat_id: int, historial: list[str]) -> dict:
+        """
+        Historial primero, instrucciones después.
+        Truncado a 10 turnos para no exceder el contexto de Llama.
+        """
         historial_reciente = historial[-10:]
 
         full_prompt = (
@@ -278,9 +274,25 @@ class AgenteOrquestador:
         raw = resp.json()["response"].strip()
         logging.info(f"[chat_id={chat_id}] RAW Ollama JSON: {raw}")
 
-        datos = json.loads(raw)
-        datos = _normalizar_claves(datos)
+        # Patrón 3: JSON vacío — degradar a CHAT antes de cualquier otra lógica
+        if not raw or raw == "{}":
+            logging.warning(f"[chat_id={chat_id}] JSON vacío recibido. Degradando a CHAT.")
+            return {
+                "accion": "CHAT",
+                "mensaje": "Entiendo lo que buscás. ¿Me confirmás qué activo querés analizar primero?"
+            }
 
+        datos = json.loads(raw)
+
+        # Patrón 3: dict vacío después de parsear
+        if not datos:
+            logging.warning(f"[chat_id={chat_id}] Dict vacío tras parseo. Degradando a CHAT.")
+            return {
+                "accion": "CHAT",
+                "mensaje": "Entiendo lo que buscás. ¿Me confirmás qué activo querés analizar primero?"
+            }
+
+        datos = _normalizar_claves(datos)
         accion = str(datos.get("accion", "")).upper()
 
         if accion not in ("CHAT", "EXEC"):
@@ -341,28 +353,27 @@ class AgenteOrquestador:
 
             # ── CASO EXEC ─────────────────────────────────────────────────
             elif accion == "EXEC":
-                # Normalizar capital a número puro antes de validar
                 datos_ia["capital"] = _extraer_numero(datos_ia.get("capital", ""))
                 datos_ia["ticker"]  = str(datos_ia.get("ticker", "")).strip().upper()
 
                 es_valido, motivo = _validar_exec(datos_ia)
 
                 if not es_valido:
-                    # Mensaje específico según qué dato falta
                     mensajes_error = {
                         "falta_capital": (
                             "Ya tengo el activo y el riesgo. "
                             "¿Con cuánto capital contás para esta inversión?"
                         ),
-                        "falta_ticker": (
-                            "¿Qué activo específico querés analizar?"
-                        ),
+                        "falta_ticker": "¿Qué activo específico querés analizar?",
                         "falta_riesgo": (
                             "¿Cuál es tu tolerancia al riesgo? "
                             "Podés elegir: bajo, medio o alto."
                         ),
                     }
-                    msg_error = mensajes_error.get(motivo, "Me faltó un dato. ¿Podés repetir el ticker, capital y riesgo?")
+                    msg_error = mensajes_error.get(
+                        motivo,
+                        "Me faltó un dato. ¿Podés repetir el ticker, capital y riesgo?"
+                    )
                     logging.error(
                         f"[chat_id={chat_id}] EXEC inválido — motivo: {motivo}. "
                         f"Payload: {datos_ia}"
