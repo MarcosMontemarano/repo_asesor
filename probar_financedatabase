@@ -1,29 +1,32 @@
+# -*- coding: utf-8 -*-
 """
 Script de prueba: financedatabase con activos de IOL
 
-Objetivo: verificar cobertura de tickers argentinos (BCBA) y CEDEARs
-antes de usarlo como base de datos madre del orquestador.
-
-Instalación previa:
+Instalacion previa:
     pip install financedatabase yfinance
 
 Ejecutar:
     python probar_financedatabase.py
 """
 
+import sys
 import financedatabase as fd
 import yfinance as yf
 import pandas as pd
+
+# Fix Windows cp1252: forzar UTF-8 en stdout
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 pd.set_option("display.max_columns", 10)
 pd.set_option("display.width", 120)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 1: Búsqueda por nombre natural → ticker
-# Estos son exactamente los casos que fallaron en el test del orquestador
+# TEST 1: Busqueda por nombre natural
 # ──────────────────────────────────────────────────────────────────────────────
 print("=" * 70)
-print(" TEST 1 — Búsqueda por nombre natural")
+print(" TEST 1 - Busqueda por nombre natural")
 print("=" * 70)
 
 equities = fd.Equities()
@@ -44,66 +47,58 @@ for nombre in BUSQUEDAS:
     try:
         resultado = equities.search(name=nombre)
         if resultado.empty:
-            print(f"❌ '{nombre}' → sin resultados")
+            print(f"[FAIL] '{nombre}' -> sin resultados")
         else:
-            # Mostrar los 3 primeros resultados con ticker y exchange
             cols = [c for c in ["longname", "exchange", "country", "sector"] if c in resultado.columns]
-            print(f"✅ '{nombre}' → {len(resultado)} resultado(s)")
+            print(f"[OK]   '{nombre}' -> {len(resultado)} resultado(s)")
             print(resultado[cols].head(3).to_string())
     except Exception as e:
-        print(f"⚠️  '{nombre}' → error: {e}")
+        print(f"[ERR]  '{nombre}' -> error: {e}")
     print()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 2: Filtrar todos los activos del mercado argentino (BCBA)
+# TEST 2: Activos argentinos en BCBA
 # ──────────────────────────────────────────────────────────────────────────────
 print("=" * 70)
-print(" TEST 2 — Activos argentinos en BCBA")
+print(" TEST 2 - Activos argentinos (exchange BUE / country Argentina)")
 print("=" * 70)
 
 try:
-    argentinos = equities.search(exchange="BUE")  # Buenos Aires Exchange
+    argentinos = equities.search(exchange="BUE")
     if argentinos.empty:
-        # Intentar con código alternativo
         argentinos = equities.search(country="Argentina")
-
     print(f"Total activos argentinos encontrados: {len(argentinos)}")
     if not argentinos.empty:
         cols = [c for c in ["longname", "exchange", "sector"] if c in argentinos.columns]
         print(argentinos[cols].head(20).to_string())
 except Exception as e:
-    print(f"⚠️  Error: {e}")
+    print(f"[ERR] {e}")
 
 print()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 3: Validar con yfinance que los tickers existen y tienen datos
+# TEST 3: Validacion cruzada con yfinance
 # ──────────────────────────────────────────────────────────────────────────────
 print("=" * 70)
-print(" TEST 3 — Validación cruzada con yfinance")
+print(" TEST 3 - Validacion con yfinance (precios reales)")
 print("=" * 70)
 
-# Tickers tal como los usa el orquestador (sin sufijo .BA para CEDEARs,
-# con sufijo para acciones locales)
 TICKERS_IOL = {
-    # Acciones locales
     "GGAL.BA": "Grupo Financiero Galicia",
     "YPFD.BA": "YPF S.A.",
-    "PAMP.BA": "Pampa Energía",
+    "PAMP.BA": "Pampa Energia",
     "BMA.BA":  "Banco Macro",
     "TXAR.BA": "Ternium Argentina",
     "LOMA.BA": "Loma Negra",
     "SUPV.BA": "Supervielle",
-    # CEDEARs / USA
-    "SPY":   "ETF S&P 500",
-    "QQQ":   "ETF Nasdaq",
-    "AAPL":  "Apple",
-    "GOOGL": "Alphabet",
-    "MELI":  "MercadoLibre",
-    "GLOB":  "Globant",
-    # Bonos — yfinance no los soporta bien, esperamos fallo
-    "AL30":  "Bono AL30 (esperamos fallo)",
-    "GD30":  "Bono GD30 (esperamos fallo)",
+    "SPY":     "ETF S&P 500",
+    "QQQ":     "ETF Nasdaq",
+    "AAPL":    "Apple",
+    "GOOGL":   "Alphabet",
+    "MELI":    "MercadoLibre",
+    "GLOB":    "Globant",
+    "AL30":    "Bono AL30 (esperamos fallo)",
+    "GD30":    "Bono GD30 (esperamos fallo)",
 }
 
 ok = 0
@@ -112,25 +107,24 @@ for ticker, nombre in TICKERS_IOL.items():
     try:
         hist = yf.Ticker(ticker).history(period="5d")
         if hist.empty:
-            print(f"⚠️  {ticker:10s} ({nombre}) → sin datos en yfinance")
+            print(f"[WARN] {ticker:10s} ({nombre}) -> sin datos en yfinance")
             fail += 1
         else:
             precio = hist["Close"].iloc[-1]
-            print(f"✅ {ticker:10s} ({nombre}) → último precio: {precio:.2f}")
+            print(f"[OK]   {ticker:10s} ({nombre}) -> ultimo precio: {precio:.2f}")
             ok += 1
     except Exception as e:
-        print(f"❌ {ticker:10s} ({nombre}) → error: {e}")
+        print(f"[ERR]  {ticker:10s} ({nombre}) -> {e}")
         fail += 1
 
 print(f"\nResumen yfinance: {ok} con datos, {fail} sin datos o error")
 print()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 4: ¿Podemos mapear nombre → ticker de forma confiable?
-# Esta es la pregunta clave para el orquestador
+# TEST 4: Mapeabilidad nombre -> ticker
 # ──────────────────────────────────────────────────────────────────────────────
 print("=" * 70)
-print(" TEST 4 — Mapeabilidad nombre → ticker (conclusión)")
+print(" TEST 4 - Mapeo nombre -> ticker (conclusion)")
 print("=" * 70)
 
 MAPEOS_ESPERADOS = [
@@ -145,17 +139,16 @@ for nombre, ticker_esperado in MAPEOS_ESPERADOS:
     try:
         resultado = equities.search(name=nombre)
         tickers_encontrados = list(resultado.index) if not resultado.empty else []
-        # Verificar si el ticker esperado (con o sin sufijo) está en los resultados
         match = any(
             ticker_esperado in t or t.startswith(ticker_esperado)
             for t in tickers_encontrados
         )
-        estado = "✅" if match else "❌"
-        print(f"{estado} '{nombre}' → esperaba {ticker_esperado}, encontró: {tickers_encontrados[:5]}")
+        estado = "[OK]  " if match else "[FAIL]"
+        print(f"{estado} '{nombre}' -> esperaba {ticker_esperado}, encontro: {tickers_encontrados[:5]}")
     except Exception as e:
-        print(f"⚠️  '{nombre}' → error: {e}")
+        print(f"[ERR]  '{nombre}' -> {e}")
 
 print()
 print("=" * 70)
-print(" Fin de pruebas. Revisá los resultados antes de integrar.")
+print(" Fin de pruebas.")
 print("=" * 70)
