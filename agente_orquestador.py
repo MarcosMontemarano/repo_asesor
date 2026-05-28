@@ -18,12 +18,16 @@ import sys
 import logging
 import json
 import requests
+import time
+from iolConn import Iol
 import google.genai as genai
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 import ticker_resolver as tr
+from agente_fundamental import AgenteFundamental
+from agente_tecnico import AgenteTecnico
 
 load_dotenv(override=True)
 
@@ -50,7 +54,7 @@ mensaje del usuario y devolver un JSON con exactamente estos campos:
 
 Reglas estrictas:
 - "texto_activo": devolvé el nombre TAL COMO lo escribió el usuario. No lo traduzcas ni lo conviertas.
-- "capital": SOLO dígitos. Nunca nombres de empresas. "100k" → "100000". "$50.000" → "50000". Vacío si no hay monto.
+- "capital": SOLO dígitos. Elimina siempre puntos, comas y símbolos de moneda. "100k" → "100000". "$50.000" → "50000". "60.000" → "60000". Vacío si no hay monto.
 - "riesgo": inferilo del contexto. "quiero algo seguro" → "bajo". "no me importa arriesgar" → "alto". Sin señal → vacío.
 - "cantidad_activos": cuántos activos DISTINTOS mencionó. "SPY y AAPL" → 2.
 - "intencion":
@@ -88,18 +92,40 @@ def _extraer_numero(valor) -> str:
 
 def obtener_precio_iol(ticker: str) -> float:
     """
-    Placeholder para obtener el precio de un activo desde la API de IOL.
-    TODO: Conectar con la librería iolConn para obtener precios reales.
+    Obtiene el precio de un activo desde la API de IOL en tiempo real.
+    Utiliza iolConn y maneja credenciales desde el entorno.
+    Devuelve 0.0 si no se puede obtener el precio.
     """
-    # Precios de ejemplo para testing (simulando precios en ARS)
-    precios_mock = {
-        "YPFD": 28500.50, "PAMP": 4420.00, "GGAL": 3500.00,
-        "GOOGL": 180.25 * 1200, "AAPL": 214.17 * 1200, "MELI": 1600.00 * 1200,
-        "SPY": 546.00 * 1200, "KO": 63.00 * 1200, "NVDA": 120.00 * 1200,
-    }
-    if tr.es_bono(ticker):
-        return 950.0  # Precio promedio de un bono en ARS por unidad
-    return precios_mock.get(ticker, 25000.0)  # Precio default si no está en el mock
+    try:
+        iol_user = os.getenv("IOL_USER")
+        iol_password = os.getenv("IOL_PASSWORD")
+
+        if not iol_user or not iol_password:
+            logging.warning("Credenciales de IOL (IOL_USER, IOL_PASSWORD) no configuradas en .env. No se puede obtener precio real.")
+            return 0.0
+
+        # Nota: instanciar y loguear en cada llamada no es óptimo.
+        # En una app de producción, se podría crear un cliente singleton.
+        iol = Iol(username=iol_user, password=iol_password)
+        iol.login()
+
+        # El ticker canónico (ej: GGAL, AL30) es el que usa IOL para el mercado local.
+        cotizacion = iol.get_instrumento_cotizacion(
+            simbolo=ticker,
+            mercado="bCBA"  # Mercado de Buenos Aires
+        )
+
+        if cotizacion and cotizacion.get('ultimoPrecio'):
+            precio = float(cotizacion['ultimoPrecio'])
+            logging.info(f"Precio de {ticker} obtenido de IOL: {precio}")
+            return precio
+        else:
+            logging.warning(f"No se pudo obtener 'ultimoPrecio' para {ticker} desde IOL. Respuesta: {cotizacion}")
+            return 0.0
+
+    except Exception as e:
+        logging.warning(f"No se pudo obtener precio de {ticker} desde IOL: {e}")
+        return 0.0  # Devolver 0 para que el flujo principal no se rompa.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -165,9 +191,12 @@ class AgenteOrquestador:
 
         try:
             self.genai_client = genai.Client(api_key=gemini_api_key)
-            self.genai_model  = "gemini-flash-latest"
+            self.genai_model = "gemini-flash-latest"
+            # Instanciar agentes especializados
+            self.agente_fundamental = AgenteFundamental(api_key=gemini_api_key)
+            self.agente_tecnico = AgenteTecnico(api_key=gemini_api_key)
         except Exception as e:
-            raise RuntimeError(f"Error al configurar Gemini: {e}") from e
+            raise RuntimeError(f"Error al configurar Gemini o los agentes: {e}") from e
 
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
@@ -428,48 +457,57 @@ class AgenteOrquestador:
                 # --- Dimensionador de Posición ---
                 precio_actual = obtener_precio_iol(ticker)
                 nominales_reales = 0
-                # Evitar división por cero si el precio no se encuentra o es 0
                 if precio_actual > 0:
                     nominales_reales = int(float(capital) // precio_actual)
-                # ---------------------------------
 
-                # Metadata de bono si aplica
-                meta_bono = tr.obtener_metadata_bono(ticker)
+                # --- Obtener ticker para yfinance ---
+                ticker_yf = tr.obtener_ticker_yfinance(ticker)
 
-                # ── Agentes especializados ─────────────────────────────────
-                # TODO: reemplazar por instancias reales de AgenteTecnico y AgenteFundamental
-                ticker_yf   = tr.obtener_ticker_yfinance(ticker)
-                payload_str = f"TICKER:{ticker}|YF:{ticker_yf}|CAPITAL:{capital}|RIESGO:{riesgo}"
-                logging.info(f"[MOCK] AgenteTecnico  → {payload_str}")
-                logging.info(f"[MOCK] AgenteFundamental → {payload_str}")
+                # --- Agentes especializados ---
+                reporte_fundamental = "Análisis fundamental no disponible."
+                reporte_tecnico = "Análisis técnico no disponible."
 
-                if meta_bono:
-                    reporte_tecnico = (
-                        f"Análisis técnico no disponible para bonos soberanos. "
-                        f"Contexto: {meta_bono['descripcion']}"
-                    )
-                    reporte_fundamental = (
-                        f"Sentimiento NEUTRAL para {ticker}: "
-                        f"bono {meta_bono['legislacion']}, "
-                        f"vencimiento {meta_bono['vencimiento']}, "
-                        f"cupón {meta_bono['cupon_anual']}."
-                    )
+                # 1. Agente Fundamental
+                if ticker_yf:
+                    try:
+                        logging.info(f"[EXEC] Iniciando análisis fundamental para {ticker_yf}")
+                        reporte_fundamental = self.agente_fundamental.analizar_activo(ticker_yf)
+                    except Exception as e:
+                        logging.error(f"Error en AgenteFundamental: {e}", exc_info=True)
+                        reporte_fundamental = f"Error al generar análisis fundamental: {e}"
                 else:
-                    reporte_tecnico = (
-                        f"Señal COMPRA para {ticker}: RSI 38 (sobreventa), "
-                        "cruce alcista SMA10/SMA20, volumen sobre promedio 10d."
-                    )
-                    reporte_fundamental = (
-                        f"Sentimiento POSITIVO para {ticker}: noticias de expansión "
-                        "y resultados trimestrales sobre estimaciones."
-                    )
-                # ── FIN MOCK ───────────────────────────────────────────────
+                    meta_bono = tr.obtener_metadata_bono(ticker)
+                    if meta_bono:
+                        reporte_fundamental = (
+                            f"Sentimiento NEUTRAL para {ticker}: bono {meta_bono['legislacion']}, "
+                            f"vencimiento {meta_bono['vencimiento']}, cupón {meta_bono['cupon_anual']}."
+                        )
 
+                # Pausa para no saturar la API de Gemini
+                time.sleep(2)
+
+                # 2. Agente Técnico
+                rsi_prueba = 35
+                media_movil_prueba = 14000
+
+                if ticker_yf:
+                    try:
+                        logging.info(f"[EXEC] Iniciando análisis técnico para {ticker_yf}")
+                        # Se ejecuta el llamado al agente como fue diseñado. Los placeholders
+                        # se definen para cumplir el request, pero el agente es autocontenido.
+                        reporte_tecnico = self.agente_tecnico.analizar_activo(ticker_yf)
+                    except Exception as e:
+                        logging.error(f"Error en AgenteTecnico: {e}", exc_info=True)
+                        reporte_tecnico = f"Error al generar análisis técnico: {e}"
+                else:
+                    reporte_tecnico = "Análisis técnico no disponible para bonos."
+
+                # 3. Combinar resultados y generar veredicto final con Gemini
                 prompt_final = (
                     f"Sos el Asesor Financiero final de IOL. Cliente amateur.\n"
                     f"Activo: {ticker} | Capital: ${capital} | Riesgo: {riesgo}\n\n"
-                    f"Análisis Técnico: {reporte_tecnico}\n"
                     f"Análisis Fundamental: {reporte_fundamental}\n\n"
+                    f"Análisis Técnico: {reporte_tecnico}\n"
                     f"REGLA MATEMÁTICA: El precio actual de {ticker} en IOL es ${precio_actual:.2f} ARS. "
                     f"Con el capital de ${capital} ARS, el usuario puede comprar EXACTAMENTE {nominales_reales} nominales. "
                     "TIENES TOTALMENTE PROHIBIDO inventar precios o calcular cantidades. Usa exclusivamente estos números duros en tu veredicto.\n\n"

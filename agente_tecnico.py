@@ -20,6 +20,8 @@ import sys
 import pandas as pd
 import yfinance as yf
 import google.genai as genai
+from dotenv import load_dotenv
+load_dotenv(override=True)
 
 class AgenteTecnico:
     """
@@ -97,6 +99,9 @@ class AgenteTecnico:
             return "Error: El cliente de IA no está disponible."
 
         try:
+            import json
+            import logging
+
             # 1. Descargar datos de yfinance para los últimos 90 días
             print(f"Descargando historial de 90 días para {simbolo}...")
             ticker = yf.Ticker(simbolo)
@@ -104,15 +109,19 @@ class AgenteTecnico:
 
             # Chequeo estricto de seguridad si no se devuelven datos
             if historial.empty:
-                return f"Error: No se encontraron datos para el símbolo '{simbolo}'. " \
-                       "Verifique que el ticker sea correcto."
+                return json.dumps({
+                    "veredicto": "ESPERAR",
+                    "motivo": f"No se encontraron datos para el símbolo '{simbolo}'. Verifique que el ticker sea correcto."
+                })
 
             # 2. Calcular indicadores técnicos y eliminar filas con NaN iniciales
             historial_con_indicadores = self._calcular_indicadores(historial)
 
             if len(historial_con_indicadores) < 5:
-                return (f"Error: No hay suficientes datos para el análisis de '{simbolo}' "
-                        "después de calcular los indicadores (se necesitan 5 días).")
+                return json.dumps({
+                    "veredicto": "ESPERAR",
+                    "motivo": f"No hay suficientes datos para el análisis de '{simbolo}' después de calcular los indicadores (se necesitan 5 días)."
+                })
 
             # 3. Preparar el prompt para la IA con los últimos 5 días de datos
             ultimos_datos = historial_con_indicadores[[
@@ -135,13 +144,36 @@ class AgenteTecnico:
                 model=self.model_name,
                 contents=[self.system_prompt, prompt]
             )
-            
+
+            total_tokens = response.usage_metadata.total_token_count
+            porcentaje = total_tokens / 1000000 * 100
+            logging.info(
+                "📊 Tokens consumidos Gemini Técnico: %s / 1000000 (%.4f%%)",
+                total_tokens,
+                porcentaje
+            )
+
             return response.text.strip()
 
         except Exception as e:
-            error_msg = f"Ocurrió un error durante el análisis de {simbolo}: {e}"
-            print(error_msg, file=sys.stderr)
-            return error_msg
+            status_code = None
+            response_obj = getattr(e, "response", None)
+            if response_obj is not None:
+                status_code = getattr(response_obj, "status_code", None)
+
+            if status_code == 503:
+                motivo = "Servicio de Gemini no disponible (503). Intenta de nuevo más tarde."
+            elif status_code == 429:
+                motivo = "Límite de solicitudes alcanzado (429). Reduce la frecuencia de llamadas o espera."
+            else:
+                motivo = f"Ocurrió un error durante el análisis de {simbolo}: {e}"
+
+            error_json = json.dumps({
+                "veredicto": "ESPERAR",
+                "motivo": motivo
+            })
+            print(error_json, file=sys.stderr)
+            return error_json
 
 if __name__ == "__main__":
     # Para ejecutar este script, necesitas instalar las librerías:
