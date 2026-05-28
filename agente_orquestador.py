@@ -25,7 +25,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 
 import ticker_resolver as tr
 
-load_dotenv()
+load_dotenv(override=True)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -84,6 +84,22 @@ def _extraer_numero(valor) -> str:
     if valor is None:
         return ""
     return re.sub(r"[^\d]", "", str(valor))
+
+
+def obtener_precio_iol(ticker: str) -> float:
+    """
+    Placeholder para obtener el precio de un activo desde la API de IOL.
+    TODO: Conectar con la librería iolConn para obtener precios reales.
+    """
+    # Precios de ejemplo para testing (simulando precios en ARS)
+    precios_mock = {
+        "YPFD": 28500.50, "PAMP": 4420.00, "GGAL": 3500.00,
+        "GOOGL": 180.25 * 1200, "AAPL": 214.17 * 1200, "MELI": 1600.00 * 1200,
+        "SPY": 546.00 * 1200, "KO": 63.00 * 1200, "NVDA": 120.00 * 1200,
+    }
+    if tr.es_bono(ticker):
+        return 950.0  # Precio promedio de un bono en ARS por unidad
+    return precios_mock.get(ticker, 25000.0)  # Precio default si no está en el mock
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -409,6 +425,14 @@ class AgenteOrquestador:
                     f"Analizando {ticker} — capital ${capital}, riesgo {riesgo}... un momento"
                 )
 
+                # --- Dimensionador de Posición ---
+                precio_actual = obtener_precio_iol(ticker)
+                nominales_reales = 0
+                # Evitar división por cero si el precio no se encuentra o es 0
+                if precio_actual > 0:
+                    nominales_reales = int(float(capital) // precio_actual)
+                # ---------------------------------
+
                 # Metadata de bono si aplica
                 meta_bono = tr.obtener_metadata_bono(ticker)
 
@@ -446,9 +470,12 @@ class AgenteOrquestador:
                     f"Activo: {ticker} | Capital: ${capital} | Riesgo: {riesgo}\n\n"
                     f"Análisis Técnico: {reporte_tecnico}\n"
                     f"Análisis Fundamental: {reporte_fundamental}\n\n"
+                    f"REGLA MATEMÁTICA: El precio actual de {ticker} en IOL es ${precio_actual:.2f} ARS. "
+                    f"Con el capital de ${capital} ARS, el usuario puede comprar EXACTAMENTE {nominales_reales} nominales. "
+                    "TIENES TOTALMENTE PROHIBIDO inventar precios o calcular cantidades. Usa exclusivamente estos números duros en tu veredicto.\n\n"
                     "Sintetizá la decisión SIN jerga técnica. "
                     "Devolvé EXACTAMENTE este formato:\n\n"
-                    "Veredicto: [COMPRAR / VENDER / RETENER] — [cantidad aprox. de nominales]\n"
+                    f"Veredicto: [COMPRAR / VENDER / RETENER] — [{nominales_reales} nominales]\n"
                     "Motivo: [máximo 2 líneas simples]\n\n"
                     "Al final preguntá si quiere profundizar o analizar otro activo."
                 )
