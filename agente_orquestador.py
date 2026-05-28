@@ -1,10 +1,12 @@
 """
 Agente Orquestador - Bot de Telegram
 
-Función:
-    Interactuar con el usuario a través de Telegram, orquestar los análisis
-    de los agentes especializados (técnico y fundamental) y consolidar una
-    recomendación final de inversión usando un modelo de IA.
+Arquitectura:
+  - Llama (Ollama): extrae entidades del lenguaje natural (texto_activo,
+    capital, riesgo, cantidad_activos, intencion). Sin reglas de negocio.
+  - Python: toda la lógica de decisión (CHAT vs EXEC), resolución de
+    tickers, persistencia de contexto entre análisis.
+  - ticker_resolver: módulo independiente para resolución nombre→ticker.
 
 Uso:
     python agente_orquestador.py
@@ -21,6 +23,8 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
+import ticker_resolver as tr
+
 load_dotenv()
 
 logging.basicConfig(
@@ -29,183 +33,99 @@ logging.basicConfig(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CATÁLOGO DE ACTIVOS IOL
+# PROMPT DE OLLAMA — Solo extracción de entidades, sin reglas de negocio.
+# El prompt es intencionalmente corto para que Llama no se desvíe.
 # ──────────────────────────────────────────────────────────────────────────────
-IOL_CATALOG = """
-ACCIONES LOCALES (Bolsa Argentina):
-  GGAL  = Grupo Financiero Galicia (banco)
-  YPFD  = YPF S.A. (petróleo y gas, empresa nacional)
-  BMA   = Banco Macro
-  PAMP  = Pampa Energía (energía eléctrica)
-  TXAR  = Ternium Argentina (acero)
-  LOMA  = Loma Negra (construcción/cemento)
-  SUPV  = Supervielle (banco)
+EXTRACTOR_PROMPT = """
+Sos un extractor de entidades financieras. Tu único trabajo es leer el
+mensaje del usuario y devolver un JSON con exactamente estos campos:
 
-CEDEARs (acciones extranjeras que cotizan en pesos en Argentina):
-  SPY   = ETF S&P 500 (diversificación total del mercado USA)
-  QQQ   = ETF Nasdaq 100 (tecnología USA)
-  AAPL  = Apple Inc.
-  MSFT  = Microsoft Corp.
-  GOOGL = Alphabet (Google)
-  AMZN  = Amazon
-  TSLA  = Tesla
-  NVDA  = NVIDIA (semiconductores/IA)
-  KO    = Coca-Cola (consumo defensivo, dividendos)
-  JPM   = JPMorgan Chase (banco USA)
-  MELI  = MercadoLibre (tecnología latinoamericana)
-  GLOB  = Globant (tecnología argentina cotizando en NYSE)
+{
+  "texto_activo": "nombre o código del activo mencionado (string, vacío si no hay ninguno)",
+  "capital":      "solo los dígitos del monto mencionado (string, vacío si no hay monto)",
+  "riesgo":       "bajo, medio o alto (inferilo del contexto, vacío si no hay señal)",
+  "cantidad_activos": 1,
+  "intencion":    "analizar, distribuir, recomendar, consulta, otro"
+}
 
-BONOS SOBERANOS ARGENTINOS (renta fija en USD):
-  AL30  = Bono vence 2030, legislación local
-  AL35  = Bono vence 2035, legislación local
-  GD30  = Bono vence 2030, legislación Nueva York (más seguro)
-  GD35  = Bono vence 2035, legislación Nueva York
-  ADVERTENCIA: AL30 y GD30 son BONOS SOBERANOS, NO acciones ni CEDEARs.
+Reglas estrictas:
+- "texto_activo": devolvé el nombre TAL COMO lo escribió el usuario. No lo traduzcas ni lo conviertas.
+- "capital": SOLO dígitos. Nunca nombres de empresas. "100k" → "100000". "$50.000" → "50000". Vacío si no hay monto.
+- "riesgo": inferilo del contexto. "quiero algo seguro" → "bajo". "no me importa arriesgar" → "alto". Sin señal → vacío.
+- "cantidad_activos": cuántos activos DISTINTOS mencionó. "SPY y AAPL" → 2.
+- "intencion":
+    "analizar"    → quiere analizar un activo específico
+    "distribuir"  → quiere repartir capital entre varios activos
+    "recomendar"  → pide sugerencias sin tener un activo en mente
+    "consulta"    → pregunta educativa, de timing, noticias, gráficos
+    "otro"        → cualquier otra cosa
 
-PERFIL DE RIESGO POR CLASE DE ACTIVO:
-  Muy bajo   → Cauciones / FCI money market
-  Bajo       → Bonos (AL30, GD30)
-  Medio      → CEDEARs defensivos (KO, SPY)
-  Medio-Alto → Acciones locales (GGAL, YPFD, PAMP)
-  Alto       → CEDEARs growth (TSLA, NVDA)
+Solo JSON puro. Sin texto fuera del objeto JSON. Sin explicaciones.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PROMPT DEL ROUTER
-#
-# Cambios respecto a la versión anterior:
-#
-#   Patrón 1 — Llama inventa RECOMENDAR/ANALIZAR cuando tiene "suficiente info":
-#     Solución: regla positiva explícita — si el usuario menciona MÁS DE UN
-#     activo, la acción es SIEMPRE CHAT sin excepción. EXEC solo para uno.
-#
-#   Patrón 2 — Nombre largo de empresa (Pampa Energía, ETF del Nasdaq) no
-#     dispara EXEC aunque el modelo conozca el ticker:
-#     Solución: regla explícita — si en tu respuesta ibas a escribir un ticker
-#     concreto del catálogo y tenés capital y riesgo, eso es EXEC, no CHAT.
-#     + Ejemplos de mapeo nombre→ticker para los casos que fallaron.
-#
-#   Patrón 3 — JSON vacío {}:
-#     Solución: en Python (_normalizar_claves y chequeo de dict vacío).
-#     En el prompt: se refuerza que la respuesta SIEMPRE debe tener "accion".
+# Frases que indican que el usuario quiere iniciar un análisis nuevo
+# (resetean capital y riesgo del contexto)
 # ──────────────────────────────────────────────────────────────────────────────
-ROUTER_INSTRUCTIONS = f"""
-{IOL_CATALOG}
+FRASES_RESET = [
+    "otro análisis", "nueva inversión", "nuevo análisis",
+    "empecemos de nuevo", "empezar de nuevo", "quiero hacer otro",
+    "análisis distinto", "inversión distinta", "cambiemos de tema",
+    "olvidá lo anterior", "borrá todo", "resetear",
+]
 
-═══════════════════════════════════════════
- TU ROL
-═══════════════════════════════════════════
-Eres el enrutador de AFMA, asesor financiero de IOL Argentina.
-Leé el mensaje del usuario y extraé: CAPITAL, RIESGO y TICKER.
-Devolvé UN SOLO objeto JSON. Sin texto fuera del JSON.
-La respuesta SIEMPRE debe contener la clave "accion". Nunca devuelvas {{}}.
-La clave de acción se escribe EXACTAMENTE así: "accion" (sin tilde).
-La clave del ticker se escribe EXACTAMENTE así: "ticker" (sin e al final).
 
-═══════════════════════════════════════════
- QUÉ ES UN TICKER
-═══════════════════════════════════════════
-Un ticker es el código corto de un activo en la bolsa.
-Cuando uses un ticker en tu mensaje, aclarás el nombre entre paréntesis.
-Ejemplos de mapeo nombre → ticker:
-  "YPF" o "YPF S.A."        → YPFD
-  "Pampa" o "Pampa Energía" → PAMP
-  "Google" o "Alphabet"     → GOOGL
-  "MercadoLibre"            → MELI
-  "ETF del Nasdaq"          → QQQ
-  "ETF del S&P" o "S&P500"  → SPY
-  "Galicia"                 → GGAL
-
-═══════════════════════════════════════════
- EXTRACCIÓN DE DATOS
-═══════════════════════════════════════════
-CAPITAL : un número. Solo dígitos. NUNCA nombres de empresas en capital.
-          Si no hay monto, capital va vacío: "".
-RIESGO  : bajo / medio / alto. Sin señal clara = medio.
-TICKER  : usá el catálogo y la tabla de mapeo de arriba.
-          Si menciona varios activos → CHAT (ver regla crítica abajo).
-
-═══════════════════════════════════════════
- REGLAS CRÍTICAS — LEER ANTES DE RESPONDER
-═══════════════════════════════════════════
-REGLA 1 — UN SOLO ACTIVO PARA EXEC:
-  Si el usuario menciona MÁS DE UN activo en el mismo mensaje,
-  la acción es SIEMPRE CHAT. Nunca EXEC con múltiples tickers.
-  Ejemplo: "SPY y AAPL con 100000" → CHAT, no EXEC.
-
-REGLA 2 — NOMBRE DE EMPRESA CON CAPITAL Y RIESGO ES EXEC:
-  Si el usuario nombra UNA empresa o producto financiero (aunque use el
-  nombre largo), y tenés capital y riesgo → la acción es EXEC con el
-  ticker mapeado del catálogo.
-  Ejemplo: "analizá Pampa Energía con 60000 riesgo alto" → EXEC ticker=PAMP
-  Ejemplo: "el ETF del Nasdaq con 30000 riesgo medio"   → EXEC ticker=QQQ
-  Ejemplo: "analizá Google con 120000 riesgo alto"       → EXEC ticker=GOOGL
-
-REGLA 3 — JSON NUNCA VACÍO:
-  La respuesta siempre tiene "accion". Si no sabés qué hacer, usá CHAT
-  con un mensaje pidiendo más información.
-
-═══════════════════════════════════════════
- ACCIONES VÁLIDAS — SOLO ESTAS DOS
-═══════════════════════════════════════════
-"CHAT" : cuando falta CAPITAL, RIESGO o TICKER, o el usuario menciona
-         múltiples activos, pide distribución, planes, gráficos, noticias,
-         preguntas de seguimiento o cualquier cosa fuera del análisis puntual.
-         Formato: {{"accion": "CHAT", "mensaje": "[respuesta breve]"}}
-
-"EXEC" : solo cuando tenés UN ticker + CAPITAL (número) + RIESGO confirmados.
-         Formato: {{"accion": "EXEC", "ticker": "[TICKER]", "capital": "[número]", "riesgo": "[nivel]"}}
-
-PROHIBIDO: RECOMENDAR, ANALIZAR, BUSCAR, DISTRIBUIR, o cualquier otra acción.
-PROHIBIDO: "acción" con tilde. Siempre "accion".
-PROHIBIDO: "ticket". Siempre "ticker".
-PROHIBIDO: nombres de empresas en el campo capital.
-PROHIBIDO: EXEC con múltiples tickers.
-PROHIBIDO: devolver JSON vacío {{}}.
-"""
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers de normalización y validación
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _normalizar_claves(datos: dict) -> dict:
-    """Corrige typos conocidos en claves del JSON de Ollama."""
-    if "accion" not in datos:
-        for variante in ("acción", "Accion", "Acción", "ACTION", "action"):
-            if variante in datos:
-                datos["accion"] = datos.pop(variante)
-                logging.warning(f"Clave '{variante}' normalizada a 'accion'.")
-                break
-    if "ticker" not in datos:
-        for variante in ("ticket", "Ticker", "TICKER", "tiker"):
-            if variante in datos:
-                datos["ticker"] = datos.pop(variante)
-                logging.warning(f"Clave '{variante}' normalizada a 'ticker'.")
-                break
-    return datos
+def _detecta_reset(texto: str) -> bool:
+    texto_norm = texto.lower()
+    return any(frase in texto_norm for frase in FRASES_RESET)
 
 
 def _extraer_numero(valor) -> str:
-    """Extrae solo dígitos del campo capital. Devuelve '' si no hay número."""
     if valor is None:
         return ""
-    solo_digitos = re.sub(r"[^\d]", "", str(valor))
-    return solo_digitos
+    return re.sub(r"[^\d]", "", str(valor))
 
 
-def _validar_exec(datos: dict) -> tuple[bool, str]:
-    """Valida que EXEC tenga ticker, capital numérico y riesgo."""
-    ticker  = datos.get("ticker", "").strip().upper()
-    capital = _extraer_numero(datos.get("capital", ""))
-    riesgo  = str(datos.get("riesgo", "")).strip()
+# ──────────────────────────────────────────────────────────────────────────────
+# Contexto persistente por usuario
+# Almacena capital y riesgo entre análisis mientras no se resetee.
+# ──────────────────────────────────────────────────────────────────────────────
+class ContextoUsuario:
+    """
+    Mantiene el estado de una conversación:
+      - historial: lista de turnos para que Llama tenga contexto
+      - capital / riesgo: persisten entre análisis
+      - ticker_pendiente: ticker del último análisis completado
+    """
 
-    if not ticker:
-        return False, "falta_ticker"
-    if not capital:
-        return False, "falta_capital"
-    if not riesgo:
-        return False, "falta_riesgo"
-    return True, ""
+    def __init__(self):
+        self.historial:        list[str] = []
+        self.capital:          str = ""
+        self.riesgo:           str = ""
+        self.ticker_pendiente: str = ""
+
+    def actualizar_desde_entidades(self, entidades: dict) -> None:
+        """Actualiza capital y riesgo solo si el mensaje trae valores nuevos."""
+        capital_nuevo = _extraer_numero(entidades.get("capital", ""))
+        riesgo_nuevo  = str(entidades.get("riesgo", "")).strip().lower()
+
+        if capital_nuevo:
+            self.capital = capital_nuevo
+        if riesgo_nuevo in ("bajo", "medio", "alto"):
+            self.riesgo = riesgo_nuevo
+
+    def resetear_contexto(self) -> None:
+        """Resetea capital, riesgo e historial para un análisis nuevo."""
+        self.capital          = ""
+        self.riesgo           = ""
+        self.ticker_pendiente = ""
+        self.historial        = []
+
+    def datos_completos(self, ticker: str) -> bool:
+        return bool(ticker and self.capital and self.riesgo)
+
+    def resumen(self) -> str:
+        return f"capital={self.capital or '?'}, riesgo={self.riesgo or '?'}"
 
 
 class AgenteOrquestador:
@@ -219,51 +139,44 @@ class AgenteOrquestador:
         if not gemini_api_key:
             raise ValueError("La API Key de Gemini no fue proporcionada.")
 
-        self.application = ApplicationBuilder().token(telegram_token).build()
+        # Inicializar índice de tickers (carga cache o regenera)
+        logging.info("Inicializando índice de tickers...")
+        tr.inicializar()
+        logging.info("Índice de tickers listo.")
 
-        # Historial respaldado en la instancia, keyed por chat_id.
-        self._historiales: dict[int, list[str]] = {}
+        self.application = ApplicationBuilder().token(telegram_token).build()
+        self._contextos: dict[int, ContextoUsuario] = {}
 
         try:
             self.genai_client = genai.Client(api_key=gemini_api_key)
-            self.genai_model = "gemini-flash-latest"
+            self.genai_model  = "gemini-flash-latest"
         except Exception as e:
-            raise RuntimeError(f"Error al configurar el cliente de Gemini: {e}") from e
+            raise RuntimeError(f"Error al configurar Gemini: {e}") from e
 
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Helper: llamada a Ollama
+    # Extracción de entidades vía Ollama
     # ──────────────────────────────────────────────────────────────────────────
-    def _llamar_ollama(self, chat_id: int, historial: list[str]) -> dict:
+    def _extraer_entidades(self, chat_id: int, historial: list[str], texto_usuario: str) -> dict:
         """
-        Historial primero, instrucciones después.
-        Truncado a 10 turnos para no exceder el contexto de Llama.
+        Llama a Ollama con el historial reciente + mensaje actual.
+        Devuelve el dict de entidades normalizado.
         """
-        historial_reciente = historial[-10:]
+        historial_reciente = historial[-6:]  # últimos 6 turnos como contexto
 
-        full_prompt = (
-            "═══════════════════════════════════════════\n"
-            " HISTORIAL DE CONVERSACIÓN ACTUAL\n"
-            "═══════════════════════════════════════════\n"
+        prompt_completo = (
+            EXTRACTOR_PROMPT
+            + "\n\n--- Historial reciente ---\n"
             + "\n".join(historial_reciente)
-            + "\n\n"
-            + "═══════════════════════════════════════════\n"
-            " INSTRUCCIONES DEL SISTEMA\n"
-            "═══════════════════════════════════════════\n"
-            + ROUTER_INSTRUCTIONS
-            + "\n\nAnalizá el historial completo y devolvé tu respuesta JSON ahora:"
-        )
-
-        logging.info(
-            f"[chat_id={chat_id}] Llamando Ollama. "
-            f"Historial ({len(historial_reciente)} turnos): {historial_reciente}"
+            + f"\n\nMensaje actual del usuario: {texto_usuario}"
+            + "\n\nDevolvé el JSON ahora:"
         )
 
         payload = {
             "model": "llama3.2",
-            "prompt": full_prompt,
+            "prompt": prompt_completo,
             "stream": False,
             "format": "json"
         }
@@ -272,148 +185,264 @@ class AgenteOrquestador:
         resp.raise_for_status()
 
         raw = resp.json()["response"].strip()
-        logging.info(f"[chat_id={chat_id}] RAW Ollama JSON: {raw}")
+        logging.info(f"[chat_id={chat_id}] Entidades extraídas: {raw}")
 
-        # Patrón 3: JSON vacío — degradar a CHAT antes de cualquier otra lógica
         if not raw or raw == "{}":
-            logging.warning(f"[chat_id={chat_id}] JSON vacío recibido. Degradando a CHAT.")
-            return {
-                "accion": "CHAT",
-                "mensaje": "Entiendo lo que buscás. ¿Me confirmás qué activo querés analizar primero?"
-            }
+            return {}
 
         datos = json.loads(raw)
+        # Normalizar capital a dígitos puros
+        datos["capital"] = _extraer_numero(datos.get("capital", ""))
+        return datos
 
-        # Patrón 3: dict vacío después de parsear
-        if not datos:
-            logging.warning(f"[chat_id={chat_id}] Dict vacío tras parseo. Degradando a CHAT.")
-            return {
-                "accion": "CHAT",
-                "mensaje": "Entiendo lo que buscás. ¿Me confirmás qué activo querés analizar primero?"
+    # ──────────────────────────────────────────────────────────────────────────
+    # Lógica de decisión — 100% en Python
+    # ──────────────────────────────────────────────────────────────────────────
+    def _decidir(
+        self,
+        entidades: dict,
+        contexto: ContextoUsuario,
+        texto_usuario: str
+    ) -> tuple[str, dict]:
+        """
+        Decide la acción a tomar basándose en las entidades extraídas y el
+        contexto persistente del usuario.
+
+        Devuelve (accion, datos) donde accion es "CHAT" o "EXEC" y datos
+        contiene los parámetros relevantes para cada caso.
+        """
+        texto_activo    = str(entidades.get("texto_activo", "")).strip()
+        intencion       = str(entidades.get("intencion", "otro")).lower()
+        cantidad        = int(entidades.get("cantidad_activos", 1) or 1)
+
+        # Actualizar contexto con los datos nuevos del mensaje
+        contexto.actualizar_desde_entidades(entidades)
+
+        # 1. Intenciones que nunca son EXEC
+        if intencion in ("distribuir", "recomendar", "consulta"):
+            return "CHAT", {"motivo": intencion}
+
+        # 2. Múltiples activos → siempre CHAT
+        if cantidad > 1:
+            return "CHAT", {"motivo": "multiples_activos"}
+
+        # 3. Resolver ticker
+        ticker = tr.resolver_ticker(texto_activo) if texto_activo else None
+
+        # 4. Ticker fuera del catálogo
+        if texto_activo and not ticker:
+            return "CHAT", {"motivo": "ticker_no_encontrado", "texto": texto_activo}
+
+        # 5. Si hay ticker nuevo y el contexto ya tenía datos, pedir confirmación
+        if (
+            ticker
+            and contexto.ticker_pendiente
+            and ticker != contexto.ticker_pendiente
+            and contexto.capital
+            and contexto.riesgo
+        ):
+            return "CHAT", {
+                "motivo":  "confirmar_contexto",
+                "ticker":  ticker,
+                "capital": contexto.capital,
+                "riesgo":  contexto.riesgo,
             }
 
-        datos = _normalizar_claves(datos)
-        accion = str(datos.get("accion", "")).upper()
+        # 6. Sin ticker en el mensaje
+        if not ticker:
+            return "CHAT", {"motivo": "falta_ticker"}
 
-        if accion not in ("CHAT", "EXEC"):
-            logging.warning(
-                f"[chat_id={chat_id}] Acción inválida '{accion}'. "
-                f"Degradando a CHAT. Payload: {datos}"
-            )
-            mensaje_rescatado = (
-                datos.get("mensaje")
-                or datos.get("message")
-                or datos.get("respuesta")
-                or "Entiendo lo que buscás. ¿Me confirmás qué activo querés analizar primero?"
-            )
-            return {"accion": "CHAT", "mensaje": mensaje_rescatado}
+        # 7. Faltan datos — preguntar específicamente qué falta
+        if not contexto.capital:
+            return "CHAT", {"motivo": "falta_capital", "ticker": ticker}
+        if not contexto.riesgo:
+            return "CHAT", {"motivo": "falta_riesgo", "ticker": ticker}
 
-        datos["accion"] = accion
-        return datos
+        # 8. Todo completo → EXEC
+        contexto.ticker_pendiente = ticker
+        return "EXEC", {
+            "ticker":  ticker,
+            "capital": contexto.capital,
+            "riesgo":  contexto.riesgo,
+        }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Generación de mensajes CHAT con Gemini
+    # ──────────────────────────────────────────────────────────────────────────
+    def _generar_mensaje_chat(self, motivo: str, datos: dict, contexto: ContextoUsuario) -> str:
+        """
+        Genera el mensaje de respuesta para cada caso de CHAT.
+        Casos simples usan texto fijo. Casos que requieren creatividad usan Gemini.
+        """
+        if motivo == "falta_capital":
+            ticker = datos.get("ticker", "")
+            meta   = tr.obtener_metadata_bono(ticker)
+            nombre = meta["nombre"] if meta else ticker
+            return (
+                f"Perfecto, vamos a analizar {nombre}. "
+                f"¿Con cuánto capital contás para esta inversión?"
+            )
+
+        if motivo == "falta_riesgo":
+            ticker = datos.get("ticker", "")
+            return (
+                f"Ya tengo el activo y el capital. "
+                f"¿Cuál es tu tolerancia al riesgo para {ticker}? "
+                f"Podés elegir: bajo, medio o alto."
+            )
+
+        if motivo == "falta_ticker":
+            return (
+                "Entiendo lo que buscás. "
+                "¿Qué activo específico querés que analice primero?"
+            )
+
+        if motivo == "ticker_no_encontrado":
+            texto = datos.get("texto", "")
+            return (
+                f"No encontré '{texto}' en el catálogo de IOL. "
+                f"¿Podés confirmar el nombre o ticker exacto?"
+            )
+
+        if motivo == "confirmar_contexto":
+            ticker  = datos.get("ticker", "")
+            capital = datos.get("capital", "")
+            riesgo  = datos.get("riesgo", "")
+            meta    = tr.obtener_metadata_bono(ticker)
+            nombre  = meta["nombre"] if meta else ticker
+            return (
+                f"Antes de analizar {nombre}, confirmame: "
+                f"¿seguimos con ${capital} y riesgo {riesgo}, "
+                f"o querés cambiar algún parámetro?"
+            )
+
+        # Para distribuir, recomendar, consulta y otros → Gemini genera la respuesta
+        prompt = (
+            "Sos AFMA, asesor financiero de IOL Argentina. "
+            "Respondé de forma natural, cálida y sin jerga técnica.\n\n"
+            f"Historial reciente: {contexto.historial[-4:]}\n"
+            f"Contexto actual: {contexto.resumen()}\n"
+            f"Motivo: {motivo}\n"
+            f"Datos: {datos}\n\n"
+            "Respondé en máximo 4 líneas."
+        )
+        try:
+            resp = self.genai_client.models.generate_content(
+                model=self.genai_model,
+                contents=[prompt]
+            )
+            return resp.text.strip()
+        except Exception as e:
+            logging.error(f"Error al generar mensaje CHAT con Gemini: {e}")
+            return "¿Podés contarme más sobre lo que buscás?"
 
     # ──────────────────────────────────────────────────────────────────────────
     # Handlers de Telegram
     # ──────────────────────────────────────────────────────────────────────────
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
-        self._historiales[chat_id] = []
-        logging.info(f"[chat_id={chat_id}] /start. Historial reseteado.")
+        self._contextos[chat_id] = ContextoUsuario()
+        logging.info(f"[chat_id={chat_id}] /start. Contexto reseteado.")
 
-        mensaje = (
-            "¡Hola! Soy AFMA, tu asesor financiero para IOL (InvertirOnline).\n\n"
+        await update.message.reply_text(
+            "Hola! Soy AFMA, tu asesor financiero para IOL (InvertirOnline).\n\n"
             "Podés hablarme de forma natural. Por ejemplo:\n"
             "  \"Tengo $100.000 y quiero invertir en CEDEARs\"\n"
-            "  \"¿Qué bonos en dólares recomendás para riesgo bajo?\"\n"
+            "  \"Qué bonos en dólares recomendás para riesgo bajo?\"\n"
             "  \"Quiero analizar YPF con riesgo alto\"\n\n"
-            "¿En qué te ayudo hoy?"
+            "En qué te ayudo hoy?"
         )
-        await update.message.reply_text(mensaje)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat_id = update.effective_chat.id
+        chat_id      = update.effective_chat.id
         texto_usuario = update.message.text
 
-        historial = self._historiales.get(chat_id, [])
-        historial.append(f"Usuario: {texto_usuario}")
+        # Obtener o crear contexto del usuario
+        if chat_id not in self._contextos:
+            self._contextos[chat_id] = ContextoUsuario()
+        contexto = self._contextos[chat_id]
+
+        # Detectar si el usuario quiere empezar un análisis nuevo
+        if _detecta_reset(texto_usuario):
+            contexto.resetear_contexto()
+            await update.message.reply_text(
+                "Perfecto, empezamos de nuevo. "
+                "Contame qué activo te interesa y con cuánto capital."
+            )
+            return
+
+        contexto.historial.append(f"Usuario: {texto_usuario}")
 
         try:
-            datos_ia = self._llamar_ollama(chat_id, historial)
-            accion = datos_ia["accion"]
+            # ── PASO 1: Llama extrae entidades ────────────────────────────
+            entidades = self._extraer_entidades(chat_id, contexto.historial, texto_usuario)
+
+            if not entidades:
+                await update.message.reply_text(
+                    "No pude procesar tu mensaje. "
+                    "Podés repetirlo de otra forma?"
+                )
+                return
+
+            # ── PASO 2: Python decide la acción ───────────────────────────
+            accion, datos = self._decidir(entidades, contexto, texto_usuario)
+
+            logging.info(
+                f"[chat_id={chat_id}] accion={accion} datos={datos} "
+                f"contexto={contexto.resumen()}"
+            )
 
             # ── CASO CHAT ─────────────────────────────────────────────────
             if accion == "CHAT":
-                mensaje = datos_ia.get("mensaje", "¿Podés contarme más? ¿Qué activo te interesa?")
-                historial.append(f"Asesor: {mensaje}")
-                self._historiales[chat_id] = historial
-                logging.info(
-                    f"[chat_id={chat_id}] CHAT respondido. "
-                    f"Historial: {len(historial)} entradas."
-                )
+                motivo  = datos.get("motivo", "otro")
+                mensaje = self._generar_mensaje_chat(motivo, datos, contexto)
+                contexto.historial.append(f"Asesor: {mensaje}")
                 await update.message.reply_text(mensaje)
 
             # ── CASO EXEC ─────────────────────────────────────────────────
             elif accion == "EXEC":
-                datos_ia["capital"] = _extraer_numero(datos_ia.get("capital", ""))
-                datos_ia["ticker"]  = str(datos_ia.get("ticker", "")).strip().upper()
-
-                es_valido, motivo = _validar_exec(datos_ia)
-
-                if not es_valido:
-                    mensajes_error = {
-                        "falta_capital": (
-                            "Ya tengo el activo y el riesgo. "
-                            "¿Con cuánto capital contás para esta inversión?"
-                        ),
-                        "falta_ticker": "¿Qué activo específico querés analizar?",
-                        "falta_riesgo": (
-                            "¿Cuál es tu tolerancia al riesgo? "
-                            "Podés elegir: bajo, medio o alto."
-                        ),
-                    }
-                    msg_error = mensajes_error.get(
-                        motivo,
-                        "Me faltó un dato. ¿Podés repetir el ticker, capital y riesgo?"
-                    )
-                    logging.error(
-                        f"[chat_id={chat_id}] EXEC inválido — motivo: {motivo}. "
-                        f"Payload: {datos_ia}"
-                    )
-                    historial.append(f"Asesor: {msg_error}")
-                    self._historiales[chat_id] = historial
-                    await update.message.reply_text(msg_error)
-                    return
-
-                ticker  = datos_ia["ticker"]
-                capital = datos_ia["capital"]
-                riesgo  = datos_ia["riesgo"]
-
-                self._historiales[chat_id] = []
-                logging.info(
-                    f"[chat_id={chat_id}] EXEC disparado: {ticker} | {capital} | {riesgo}. "
-                    "Historial reseteado."
-                )
+                ticker  = datos["ticker"]
+                capital = datos["capital"]
+                riesgo  = datos["riesgo"]
 
                 await update.message.reply_text(
-                    f"Analizando {ticker} — capital ${capital}, riesgo {riesgo}... un momento 🔍"
+                    f"Analizando {ticker} — capital ${capital}, riesgo {riesgo}... un momento"
                 )
 
-                # ── MOCK agentes especializados ────────────────────────────
+                # Metadata de bono si aplica
+                meta_bono = tr.obtener_metadata_bono(ticker)
+
+                # ── Agentes especializados ─────────────────────────────────
                 # TODO: reemplazar por instancias reales de AgenteTecnico y AgenteFundamental
-                payload_str = f"TICKER:{ticker}|CAPITAL:{capital}|RIESGO:{riesgo}"
+                ticker_yf   = tr.obtener_ticker_yfinance(ticker)
+                payload_str = f"TICKER:{ticker}|YF:{ticker_yf}|CAPITAL:{capital}|RIESGO:{riesgo}"
                 logging.info(f"[MOCK] AgenteTecnico  → {payload_str}")
-                reporte_tecnico = (
-                    f"Señal COMPRA para {ticker}: RSI 38 (sobreventa), "
-                    "cruce alcista SMA10/SMA20, volumen sobre promedio 10d."
-                )
                 logging.info(f"[MOCK] AgenteFundamental → {payload_str}")
-                reporte_fundamental = (
-                    f"Sentimiento POSITIVO para {ticker}: noticias de expansión "
-                    "y resultados trimestrales sobre estimaciones."
-                )
+
+                if meta_bono:
+                    reporte_tecnico = (
+                        f"Análisis técnico no disponible para bonos soberanos. "
+                        f"Contexto: {meta_bono['descripcion']}"
+                    )
+                    reporte_fundamental = (
+                        f"Sentimiento NEUTRAL para {ticker}: "
+                        f"bono {meta_bono['legislacion']}, "
+                        f"vencimiento {meta_bono['vencimiento']}, "
+                        f"cupón {meta_bono['cupon_anual']}."
+                    )
+                else:
+                    reporte_tecnico = (
+                        f"Señal COMPRA para {ticker}: RSI 38 (sobreventa), "
+                        "cruce alcista SMA10/SMA20, volumen sobre promedio 10d."
+                    )
+                    reporte_fundamental = (
+                        f"Sentimiento POSITIVO para {ticker}: noticias de expansión "
+                        "y resultados trimestrales sobre estimaciones."
+                    )
                 # ── FIN MOCK ───────────────────────────────────────────────
 
                 prompt_final = (
-                    f"Eres el Asesor Financiero final de IOL. Cliente amateur.\n"
+                    f"Sos el Asesor Financiero final de IOL. Cliente amateur.\n"
                     f"Activo: {ticker} | Capital: ${capital} | Riesgo: {riesgo}\n\n"
                     f"Análisis Técnico: {reporte_tecnico}\n"
                     f"Análisis Fundamental: {reporte_fundamental}\n\n"
@@ -421,36 +450,35 @@ class AgenteOrquestador:
                     "Devolvé EXACTAMENTE este formato:\n\n"
                     "Veredicto: [COMPRAR / VENDER / RETENER] — [cantidad aprox. de nominales]\n"
                     "Motivo: [máximo 2 líneas simples]\n\n"
-                    "¿Querés profundizar en algún detalle o analizamos otro activo?"
+                    "Al final preguntá si quiere profundizar o analizar otro activo."
                 )
 
                 response = self.genai_client.models.generate_content(
                     model=self.genai_model,
                     contents=[prompt_final]
                 )
-                await update.message.reply_text(response.text.strip())
+                mensaje_final = response.text.strip()
+                contexto.historial.append(f"Asesor: {mensaje_final}")
+                await update.message.reply_text(mensaje_final)
 
         except requests.exceptions.ConnectionError:
-            logging.error(f"[chat_id={chat_id}] No se pudo conectar con Ollama.")
-            self._historiales.pop(chat_id, None)
+            logging.error(f"[chat_id={chat_id}] Ollama no disponible.")
             await update.message.reply_text(
-                "⚠️ El motor de IA local no está disponible ahora mismo. "
-                "Por favor, contactá al administrador."
+                "El motor de IA local no esta disponible. "
+                "Por favor contacta al administrador."
             )
 
         except json.JSONDecodeError as e:
-            logging.error(f"[chat_id={chat_id}] JSONDecodeError de Ollama: {e}", exc_info=True)
-            self._historiales.pop(chat_id, None)
+            logging.error(f"[chat_id={chat_id}] JSONDecodeError: {e}", exc_info=True)
             await update.message.reply_text(
                 "Tuve un problema procesando tu mensaje. "
-                "¿Podemos empezar de nuevo? Contame qué activo te interesa."
+                "Podemos intentarlo de nuevo?"
             )
 
         except Exception as e:
             logging.error(f"[chat_id={chat_id}] Error inesperado: {e}", exc_info=True)
-            self._historiales.pop(chat_id, None)
             await update.message.reply_text(
-                "Ocurrió un error inesperado. Intentá de nuevo en unos segundos."
+                "Ocurrio un error inesperado. Intentá de nuevo en unos segundos."
             )
 
     def run(self):
@@ -463,15 +491,15 @@ if __name__ == "__main__":
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
     if not TELEGRAM_TOKEN:
-        logging.error("TELEGRAM_TOKEN no configurado. Revisá tu .env")
+        logging.error("TELEGRAM_TOKEN no configurado.")
         sys.exit(1)
     if not GEMINI_API_KEY:
-        logging.error("GEMINI_API_KEY no configurado. Revisá tu .env")
+        logging.error("GEMINI_API_KEY no configurado.")
         sys.exit(1)
 
     try:
         bot = AgenteOrquestador(telegram_token=TELEGRAM_TOKEN, gemini_api_key=GEMINI_API_KEY)
         bot.run()
     except (ValueError, RuntimeError) as e:
-        logging.error(f"Error al inicializar el bot: {e}")
+        logging.error(f"Error al inicializar: {e}")
         sys.exit(1)
