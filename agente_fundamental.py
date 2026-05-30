@@ -1,15 +1,15 @@
 """
-Agente 3: Analista Fundamental de Noticias
+Agente Fundamental — Analista de Noticias y Sentimiento de Mercado
 
-Función:
-    Extraer las noticias más recientes de un activo financiero y utilizar un
-    modelo de IA para analizar el sentimiento del mercado basado en los titulares.
-    Implementa un fallback a un ETF proxy (ARGT) para activos sin noticias.
+Motor: Groq (Llama 3.3 70B) — reemplaza Gemini
 
-Skills:
-    - Extracción de noticias de mercado (yfinance)
-    - Interacción con APIs de IA generativa (google-generativeai)
-    - Procesamiento de texto para prompts de IA
+Cadena de fuentes (Score de Cobertura Informacional — SCI):
+  Nivel 1 (paralelo): yfinance + Finnhub
+  Nivel 2 (si SCI < 3): NewsAPI + Alpha Vantage
+  Nivel 3 (si SCI < 3): Reddit → Twitter/X
+
+SCI = (noticias_relevantes × 1.5) + (noticias_recientes_48h × 1.0) + (fuentes_distintas × 0.5)
+Umbral mínimo para considerar información suficiente: SCI >= 3
 
 Uso:
     python agente_fundamental.py
@@ -18,188 +18,526 @@ Uso:
 import os
 import sys
 import time
-import yfinance as yf
-import google.genai as genai
+import logging
+import requests
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
 
+import yfinance as yf
+
+load_dotenv(override=True)
+
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Constantes
+# ──────────────────────────────────────────────────────────────────────────────
+SCI_UMBRAL          = 3.0
+PESO_RELEVANCIA     = 1.5
+PESO_RECENCIA       = 1.0
+PESO_DIVERSIDAD     = 0.5
+VENTANA_RECENCIA_H  = 48   # horas para considerar una noticia "reciente"
+MAX_NOTICIAS_NIVEL  = 5    # máximo de noticias a procesar por fuente
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL   = "llama-3.3-70b-versatile"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Estructura de noticia normalizada
+# Todas las fuentes producen este formato para que el SCI sea uniforme.
+# ──────────────────────────────────────────────────────────────────────────────
+def _noticia(titulo: str, resumen: str, publisher: str, timestamp_unix: float | None) -> dict:
+    return {
+        "titulo":    titulo.strip(),
+        "resumen":   resumen.strip(),
+        "publisher": publisher.strip().lower(),
+        "ts":        timestamp_unix,   # None si no disponible
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Score de Cobertura Informacional (SCI)
+# Fundamento: EMH forma semi-fuerte — solo cuenta información reciente,
+# relevante y proveniente de fuentes diversas.
+# ──────────────────────────────────────────────────────────────────────────────
+def _calcular_sci(noticias: list[dict], simbolo: str) -> tuple[float, list[dict]]:
+    """
+    Calcula el SCI de una lista de noticias normalizadas.
+    Devuelve (sci_score, noticias_relevantes).
+    Una noticia es relevante si menciona el símbolo o empresa en título o resumen.
+    """
+    ahora = datetime.now(timezone.utc)
+    ventana = timedelta(hours=VENTANA_RECENCIA_H)
+    simbolo_lower = simbolo.lower()
+
+    relevantes   = []
+    recientes    = 0
+    publishers   = set()
+
+    for n in noticias:
+        texto = (n["titulo"] + " " + n["resumen"]).lower()
+        es_relevante = simbolo_lower in texto
+
+        if es_relevante:
+            relevantes.append(n)
+            publishers.add(n["publisher"])
+
+            if n["ts"]:
+                try:
+                    dt = datetime.fromtimestamp(n["ts"], tz=timezone.utc)
+                    if ahora - dt <= ventana:
+                        recientes += 1
+                except Exception:
+                    pass
+
+    sci = (
+        len(relevantes)  * PESO_RELEVANCIA +
+        recientes        * PESO_RECENCIA   +
+        len(publishers)  * PESO_DIVERSIDAD
+    )
+
+    logger.info(
+        f"SCI para {simbolo}: {sci:.2f} "
+        f"(relevantes={len(relevantes)}, recientes={recientes}, "
+        f"publishers={len(publishers)})"
+    )
+    return sci, relevantes
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fuente 1: yfinance
+# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_yfinance(simbolo: str) -> list[dict]:
+    try:
+        ticker  = yf.Ticker(simbolo)
+        noticias_raw = ticker.news or []
+        resultado = []
+        for n in noticias_raw[:MAX_NOTICIAS_NIVEL]:
+            if not isinstance(n, dict):
+                continue
+            contenido = n.get("content", n)
+            if not isinstance(contenido, dict):
+                continue
+            titulo  = contenido.get("title", "")
+            resumen = contenido.get("summary", "")
+            if not titulo or " " not in titulo:
+                continue
+            publisher = contenido.get("provider", {})
+            if isinstance(publisher, dict):
+                publisher = publisher.get("displayName", "yfinance")
+            ts = None
+            pub_date = contenido.get("pubDate") or contenido.get("publishedAt")
+            if pub_date:
+                try:
+                    ts = datetime.fromisoformat(
+                        pub_date.replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    pass
+            resultado.append(_noticia(titulo, resumen, publisher or "yfinance", ts))
+        logger.info(f"yfinance: {len(resultado)} noticias para {simbolo}")
+        return resultado
+    except Exception as e:
+        logger.warning(f"yfinance error para {simbolo}: {e}")
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fuente 2: Finnhub
+# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_finnhub(simbolo: str) -> list[dict]:
+    api_key = os.getenv("FINNHUB_API_KEY", "")
+    if not api_key:
+        logger.warning("FINNHUB_API_KEY no configurada. Saltando Finnhub.")
+        return []
+    try:
+        hoy   = datetime.now().strftime("%Y-%m-%d")
+        desde = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        url   = "https://finnhub.io/api/v1/company-news"
+        resp  = requests.get(
+            url,
+            params={"symbol": simbolo, "from": desde, "to": hoy, "token": api_key},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"Finnhub HTTP {resp.status_code} para {simbolo}")
+            return []
+        items = resp.json()[:MAX_NOTICIAS_NIVEL]
+        resultado = [
+            _noticia(
+                i.get("headline", ""),
+                i.get("summary", ""),
+                i.get("source", "finnhub"),
+                i.get("datetime"),
+            )
+            for i in items
+            if i.get("headline")
+        ]
+        logger.info(f"Finnhub: {len(resultado)} noticias para {simbolo}")
+        return resultado
+    except Exception as e:
+        logger.warning(f"Finnhub error para {simbolo}: {e}")
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fuente 3: NewsAPI
+# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_newsapi(simbolo: str) -> list[dict]:
+    api_key = os.getenv("NEWSAPI_KEY", "")
+    if not api_key:
+        logger.warning("NEWSAPI_KEY no configurada. Saltando NewsAPI.")
+        return []
+    try:
+        url  = "https://newsapi.org/v2/everything"
+        resp = requests.get(
+            url,
+            params={
+                "q":        simbolo,
+                "language": "en",
+                "sortBy":   "publishedAt",
+                "pageSize": MAX_NOTICIAS_NIVEL,
+                "apiKey":   api_key,
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"NewsAPI HTTP {resp.status_code}")
+            return []
+        articles = resp.json().get("articles", [])
+        resultado = []
+        for a in articles:
+            titulo  = a.get("title", "")
+            resumen = a.get("description", "") or a.get("content", "")
+            pub     = a.get("source", {}).get("name", "newsapi")
+            ts      = None
+            published = a.get("publishedAt")
+            if published:
+                try:
+                    ts = datetime.fromisoformat(
+                        published.replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    pass
+            if titulo and " " in titulo:
+                resultado.append(_noticia(titulo, resumen, pub, ts))
+        logger.info(f"NewsAPI: {len(resultado)} noticias para {simbolo}")
+        return resultado
+    except Exception as e:
+        logger.warning(f"NewsAPI error: {e}")
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fuente 4: Alpha Vantage (News Sentiment)
+# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_alphavantage(simbolo: str) -> list[dict]:
+    api_key = os.getenv("ALPHAVANTAGE_KEY", "")
+    if not api_key:
+        logger.warning("ALPHAVANTAGE_KEY no configurada. Saltando Alpha Vantage.")
+        return []
+    try:
+        url  = "https://www.alphavantage.co/query"
+        resp = requests.get(
+            url,
+            params={
+                "function": "NEWS_SENTIMENT",
+                "tickers":  simbolo,
+                "limit":    MAX_NOTICIAS_NIVEL,
+                "apikey":   api_key,
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"Alpha Vantage HTTP {resp.status_code}")
+            return []
+        feed = resp.json().get("feed", [])
+        resultado = []
+        for a in feed:
+            titulo  = a.get("title", "")
+            resumen = a.get("summary", "")
+            pub     = a.get("source", "alphavantage")
+            ts      = None
+            time_str = a.get("time_published", "")
+            if time_str:
+                try:
+                    # Formato: 20240115T143000
+                    ts = datetime.strptime(
+                        time_str, "%Y%m%dT%H%M%S"
+                    ).replace(tzinfo=timezone.utc).timestamp()
+                except Exception:
+                    pass
+            if titulo:
+                resultado.append(_noticia(titulo, resumen, pub, ts))
+        logger.info(f"Alpha Vantage: {len(resultado)} noticias para {simbolo}")
+        return resultado
+    except Exception as e:
+        logger.warning(f"Alpha Vantage error: {e}")
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fuente 5: Reddit
+# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_reddit(simbolo: str) -> list[dict]:
+    client_id     = os.getenv("REDDIT_CLIENT_ID", "")
+    client_secret = os.getenv("REDDIT_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        logger.warning("REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET no configurados. Saltando Reddit.")
+        return []
+    try:
+        # Autenticación
+        auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
+        headers = {"User-Agent": "AFMA/1.0"}
+        token_resp = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=auth,
+            data={"grant_type": "client_credentials"},
+            headers=headers,
+            timeout=10,
+        )
+        if token_resp.status_code != 200:
+            logger.warning(f"Reddit auth HTTP {token_resp.status_code}")
+            return []
+        token = token_resp.json().get("access_token", "")
+
+        # Buscar en subreddits financieros relevantes
+        subreddits = ["investing", "stocks", "merval", "argentina"]
+        resultado  = []
+        headers["Authorization"] = f"bearer {token}"
+
+        for sub in subreddits:
+            if len(resultado) >= MAX_NOTICIAS_NIVEL:
+                break
+            resp = requests.get(
+                f"https://oauth.reddit.com/r/{sub}/search",
+                params={"q": simbolo, "sort": "new", "limit": 3, "t": "week"},
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            posts = resp.json().get("data", {}).get("children", [])
+            for p in posts:
+                data    = p.get("data", {})
+                titulo  = data.get("title", "")
+                resumen = data.get("selftext", "")[:300]
+                ts      = data.get("created_utc")
+                if titulo:
+                    resultado.append(_noticia(titulo, resumen, f"reddit/r/{sub}", ts))
+
+        logger.info(f"Reddit: {len(resultado)} posts para {simbolo}")
+        return resultado
+    except Exception as e:
+        logger.warning(f"Reddit error: {e}")
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fuente 6: Twitter/X
+# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_twitter(simbolo: str) -> list[dict]:
+    bearer_token = os.getenv("TWITTER_BEARER_TOKEN", "")
+    if not bearer_token:
+        logger.warning("TWITTER_BEARER_TOKEN no configurado. Saltando Twitter.")
+        return []
+    try:
+        headers = {"Authorization": f"Bearer {bearer_token}"}
+        resp = requests.get(
+            "https://api.twitter.com/2/tweets/search/recent",
+            params={
+                "query":       f"${simbolo} lang:en -is:retweet",
+                "max_results": MAX_NOTICIAS_NIVEL,
+                "tweet.fields": "created_at,author_id",
+            },
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"Twitter HTTP {resp.status_code}")
+            return []
+        tweets = resp.json().get("data", [])
+        resultado = []
+        for t in tweets:
+            texto = t.get("text", "")
+            ts    = None
+            created = t.get("created_at")
+            if created:
+                try:
+                    ts = datetime.fromisoformat(
+                        created.replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    pass
+            if texto:
+                resultado.append(_noticia(texto[:120], "", "twitter", ts))
+        logger.info(f"Twitter: {len(resultado)} tweets para {simbolo}")
+        return resultado
+    except Exception as e:
+        logger.warning(f"Twitter error: {e}")
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Motor Groq
+# ──────────────────────────────────────────────────────────────────────────────
+def _llamar_groq(system_prompt: str, user_prompt: str, api_key: str) -> str:
+    """
+    Llama a Groq con reintentos para 429.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens":  800,
+    }
+    for intento in range(3):
+        try:
+            resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 429:
+                espera = 60
+                logger.warning(f"Groq 429 — esperando {espera}s (intento {intento+1}/3)")
+                time.sleep(espera)
+                continue
+            if resp.status_code != 200:
+                logger.error(f"Groq HTTP {resp.status_code}: {resp.text[:200]}")
+                return f"ERROR - Groq HTTP {resp.status_code}"
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.error(f"Groq error intento {intento+1}: {e}")
+            if intento < 2:
+                time.sleep(5)
+    return "ERROR - Groq no disponible después de 3 intentos."
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Clase principal
+# ──────────────────────────────────────────────────────────────────────────────
 class AgenteFundamental:
     """
-    Una clase para realizar análisis fundamental basado en noticias de activos
-    financieros y generar una clasificación de sentimiento (POSITIVO, NEGATIVO, NEUTRAL)
-    usando un modelo de IA.
+    Analista fundamental con cadena de fuentes y SCI como criterio de avance.
+    Motor: Groq Llama 3.3 70B.
     """
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str = None):
         """
-        Inicializa el agente, configurando el acceso a la API de IA de Gemini.
-
-        Args:
-            api_key (str): La clave de API para el servicio de IA generativa de Google.
-
-        Raises:
-            ValueError: Si la clave de API no es proporcionada.
-            RuntimeError: Si hay un error al configurar el modelo de IA.
+        api_key: Groq API key. Si no se pasa, la lee de GROQ_API_KEY en .env.
+        Se mantiene compatibilidad con el parámetro api_key del orquestador.
         """
-        if not api_key:
-            raise ValueError("La API Key de Gemini no fue proporcionada.")
-
-        try:
-            self.client = genai.Client(api_key=api_key)
-            self.model_name = "gemini-flash-latest"
-            
-            # Prompt para análisis fundamental de un activo específico
-            self.system_prompt_template = (
-                "Eres un analista fundamental financiero experto. Lee los siguientes "
-                "titulares y resúmenes.\n\n"
-                "ATENCIÓN FILTRO DE RUIDO: El activo a analizar es estrictamente {simbolo}. "
-                "Si el titular o el resumen NO mencionan explícitamente a {simbolo} o al "
-                "nombre de su empresa matriz, DEBES clasificar la fuente obligatoriamente "
-                "como IRRELEVANTE. Está totalmente PROHIBIDO basar tu CONCLUSIÓN final en "
-                "fuentes irrelevantes.\n\n"
-                "REGLA DE PROYECCIÓN ESTRATÉGICA: Es tu obligación identificar si el contexto está "
-                "influenciado por eventos globales o macroeconómicos futuros próximos (ej. el inminente "
-                "Mundial de fútbol, elecciones, anuncios de tasas). Debes evaluar cómo ese evento "
-                "impactará en el modelo de negocio de {simbolo}.\n\n"
-                "Tu respuesta debe tener este formato exacto:\n"
-                "    Enumera cada noticia de forma muy breve e indica si su índole es "
-                "POSITIVA, NEGATIVA, NEUTRAL o IRRELEVANTE. (Ej: - Fuente 1: [Breve título/resumen] "
-                "-> Índole: Positiva).\n"
-                "    Al final, deja un renglón en blanco y escribe la palabra CONCLUSIÓN: "
-                "seguida de tu veredicto final (POSITIVO, NEGATIVO o NEUTRAL) y "
-                "justifica en máximo 3 líneas por qué, utilizando tu proyección estratégica."
+        self.groq_api_key = api_key or os.getenv("GROQ_API_KEY", "")
+        if not self.groq_api_key:
+            raise ValueError(
+                "GROQ_API_KEY no configurada. "
+                "Agregá GROQ_API_KEY=tu_key al .env"
             )
-            
-            # Prompt para análisis macroeconómico usando el proxy ARGT
-            self.proxy_system_prompt = (
-                "Eres un analista macroeconómico experto. El usuario quiere invertir en "
-                "renta fija local/bonos, por lo que te proveo noticias recientes del ETF "
-                "de Argentina (ARGT) como proxy del contexto país.\n\n"
-                "REGLA DE PROYECCIÓN ESTRATÉGICA: Identifica en las noticias la influencia de "
-                "eventos globales o macroeconómicos futuros próximos (ej. elecciones, el Mundial, "
-                "decisiones del FMI). Evalúa cómo impactarán en el riesgo país y en los bonos locales.\n\n"
-                "Basado en esto, define si el sentimiento macroeconómico es POSITIVO, NEGATIVO o NEUTRAL. "
-                "Enumera 3 fuentes brevemente y termina con un renglón en blanco seguido "
-                "de la palabra CONCLUSIÓN: tu veredicto y 3 líneas de justificación estratégica."
-            )
-        except Exception as e:
-            raise RuntimeError(f"Error al configurar el cliente de IA de Gemini: {e}") from e
 
-    def _generar_contenido_con_reintento(self, **kwargs) -> genai.types.GenerateContentResponse:
-        """
-        Envuelve la llamada a la API de Gemini con una lógica de reintento para
-        manejar errores de límite de cuota (429).
-        """
-        for i in range(2):  # 0: primer intento, 1: reintento
-            try:
-                response = self.client.models.generate_content(**kwargs)
-                return response
-            except Exception as e:
-                # Si es un error de cuota y es el primer intento
-                if '429' in str(e) and i < 1:
-                    print("Límite de cuota de API alcanzado. Esperando 60 segundos antes de reintentar...")
-                    time.sleep(60)
-                    continue  # Pasa a la siguiente iteración para reintentar
-                else:
-                    # Si es otro error o si el reintento también falla, se lanza la excepción
-                    raise e
-        # Este punto no debería ser alcanzado si la lógica es correcta, pero por si acaso.
-        raise RuntimeError(
-            "La llamada a la API falló después de un reintento por límite de cuota."
+        self.system_prompt_template = (
+            "Eres un analista fundamental financiero experto. "
+            "Analizás noticias sobre {simbolo} y determinás el sentimiento del mercado.\n\n"
+            "FILTRO DE RUIDO: Solo considerás noticias que mencionen explícitamente "
+            "a {simbolo} o su empresa. Las demás son IRRELEVANTES.\n\n"
+            "PROYECCIÓN ESTRATÉGICA: Identificá eventos globales o macroeconómicos "
+            "próximos (elecciones, decisiones de tasas, eventos deportivos globales) "
+            "y evaluá su impacto en {simbolo}.\n\n"
+            "Formato de respuesta:\n"
+            "- Fuente N: [título breve] -> Índole: POSITIVA/NEGATIVA/NEUTRAL/IRRELEVANTE\n"
+            "\nCONCLUSIÓN: [POSITIVO/NEGATIVO/NEUTRAL] — [justificación en máximo 3 líneas]"
         )
+
+        self.proxy_system_prompt = (
+            "Eres un analista macroeconómico experto en Argentina. "
+            "Analizás noticias del ETF ARGT como proxy del riesgo país.\n\n"
+            "PROYECCIÓN ESTRATÉGICA: Identificá impacto de eventos globales "
+            "(FMI, elecciones, commodities) en bonos soberanos argentinos.\n\n"
+            "Formato: enumera 3 fuentes brevemente.\n"
+            "CONCLUSIÓN: [POSITIVO/NEGATIVO/NEUTRAL] — [justificación en 3 líneas]"
+        )
+
+    def _formatear_noticias(self, noticias: list[dict]) -> str:
+        lineas = []
+        for i, n in enumerate(noticias, 1):
+            lineas.append(f"- Fuente {i} ({n['publisher']}): {n['titulo']}. {n['resumen'][:200]}")
+        return "\n".join(lineas)
 
     def analizar_activo(self, simbolo: str) -> str:
         """
-        Descarga noticias, las formatea y obtiene un veredicto de la IA.
-        Si no encuentra noticias, usa el ETF 'ARGT' como proxy macroeconómico.
-
-        Args:
-            simbolo (str): El símbolo del activo a analizar (ej. 'AAPL', 'MELI').
-
-        Returns:
-            str: La clasificación de sentimiento de la IA o un mensaje de error.
+        Ejecuta la cadena de fuentes con SCI como criterio de avance.
+        Devuelve el análisis de sentimiento del agente.
         """
-        try:
-            # 1. Intenta extraer noticias del símbolo original
-            print(f"Buscando noticias recientes para {simbolo} en yfinance...")
-            ticker = yf.Ticker(simbolo)
-            noticias = ticker.news
-            prompt_a_usar = self.system_prompt_template.format(simbolo=simbolo)
+        logger.info(f"[AgenteFundamental] Iniciando análisis para {simbolo}")
+        todas_las_noticias: list[dict] = []
 
-            # 2. Si no hay noticias, usa el fallback al proxy 'ARGT'
-            if not noticias:
-                print(f"No se encontraron noticias para '{simbolo}'. Usando 'ARGT' como proxy macroeconómico...")
-                ticker_proxy = yf.Ticker('ARGT')
-                noticias = ticker_proxy.news
-                prompt_a_usar = self.proxy_system_prompt
+        # ── NIVEL 1: yfinance + Finnhub en paralelo ────────────────────────
+        logger.info(f"[Nivel 1] yfinance + Finnhub para {simbolo}")
+        noticias_yf  = _fetch_yfinance(simbolo)
+        noticias_fh  = _fetch_finnhub(simbolo)
+        todas_las_noticias = noticias_yf + noticias_fh
 
-            # Si ni el original ni el proxy tienen noticias, devuelve un mensaje.
-            if not noticias:
-                return "NEUTRAL - No se encontraron noticias para el activo ni para el proxy 'ARGT'."
+        sci, relevantes = _calcular_sci(todas_las_noticias, simbolo)
 
-            # 3. Procesamiento normal de las noticias encontradas (originales o del proxy)
-            print("Noticias encontradas. Procesando...")
-            ultimas_noticias = noticias[:5]
-            titulares_formateados = []
-            for noticia in ultimas_noticias:
-                # Verificar si el item es un diccionario
-                if not isinstance(noticia, dict):
-                    continue
+        # ── NIVEL 2: NewsAPI + Alpha Vantage si SCI < umbral ──────────────
+        if sci < SCI_UMBRAL:
+            logger.info(f"[Nivel 2] SCI={sci:.2f} < {SCI_UMBRAL}. Consultando NewsAPI + Alpha Vantage...")
+            noticias_na = _fetch_newsapi(simbolo)
+            noticias_av = _fetch_alphavantage(simbolo)
+            todas_las_noticias += noticias_na + noticias_av
+            sci, relevantes = _calcular_sci(todas_las_noticias, simbolo)
 
-                # Acceder de forma segura al contenido (anidado o directo)
-                contenido = noticia.get('content', noticia)
-                if not isinstance(contenido, dict):
-                    continue
+        # ── NIVEL 3: Reddit + Twitter si SCI sigue bajo ───────────────────
+        if sci < SCI_UMBRAL:
+            logger.info(f"[Nivel 3] SCI={sci:.2f} < {SCI_UMBRAL}. Consultando Reddit + Twitter...")
+            noticias_reddit  = _fetch_reddit(simbolo)
+            noticias_twitter = _fetch_twitter(simbolo)
+            todas_las_noticias += noticias_reddit + noticias_twitter
+            sci, relevantes = _calcular_sci(todas_las_noticias, simbolo)
 
-                # Extraer título y resumen
-                titulo = contenido.get('title', '')
-                resumen = contenido.get('summary', '')
+        # ── Fallback: proxy ARGT si no hay nada relevante ─────────────────
+        if not relevantes:
+            logger.info(f"Sin noticias relevantes para {simbolo}. Usando proxy ARGT...")
+            noticias_argt = _fetch_yfinance("ARGT") + _fetch_finnhub("ARGT")
+            if not noticias_argt:
+                return "NEUTRAL - No se encontraron noticias para el activo ni para el proxy ARGT."
+            prompt_noticias = self._formatear_noticias(noticias_argt[:5])
+            return _llamar_groq(self.proxy_system_prompt, prompt_noticias, self.groq_api_key)
 
-                # Validar: ignorar si están vacíos o si el título parece un UUID (sin espacios)
-                if not titulo or not resumen or ' ' not in titulo:
-                    continue
+        # ── Análisis con Groq ──────────────────────────────────────────────
+        noticias_a_analizar = relevantes[:MAX_NOTICIAS_NIVEL]
+        prompt_sistema  = self.system_prompt_template.format(simbolo=simbolo)
+        prompt_noticias = (
+            f"SCI calculado: {sci:.2f} (umbral={SCI_UMBRAL})\n"
+            f"Noticias relevantes encontradas: {len(relevantes)}\n\n"
+            + self._formatear_noticias(noticias_a_analizar)
+        )
 
-                # Concatenar título y resumen para formar el texto de la noticia
-                texto_noticia = f"{titulo}. {resumen}"
-                titulares_formateados.append(f"- {texto_noticia}")
-
-            prompt_noticias = "\n".join(titulares_formateados)
-
-            if not prompt_noticias.strip():
-                return "NEUTRAL - No se pudo extraer contenido de las noticias para analizar."
-
-            # 4. Enviar a la IA para análisis con el prompt correspondiente
-            print("Enviando datos a la IA para análisis de sentimiento...")
-            response = self._generar_contenido_con_reintento(
-                model=self.model_name,
-                contents=[prompt_a_usar, prompt_noticias]
-            )
-
-            return response.text.strip()
-
-        except Exception as e:
-            error_msg = f"Ocurrió un error durante el análisis de {simbolo}: {e}"
-            print(error_msg, file=sys.stderr)
-            return f"ERROR - {error_msg}"
+        logger.info(
+            f"[AgenteFundamental] Enviando {len(noticias_a_analizar)} noticias "
+            f"a Groq. SCI={sci:.2f}"
+        )
+        return _llamar_groq(prompt_sistema, prompt_noticias, self.groq_api_key)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Ejecución directa para pruebas
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    if not GEMINI_API_KEY:
-        print("Error: La variable de entorno GEMINI_API_KEY no está configurada.", file=sys.stderr)
-        sys.exit(1)
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO,
+    )
 
-    agente = AgenteFundamental(api_key=GEMINI_API_KEY)
-    # Ejemplo con un bono que probablemente no tenga noticias en yfinance para probar el fallback
-    simbolo_ejemplo = "NVDA"
-    veredicto = agente.analizar_activo(simbolo_ejemplo)
-    print("\n--- Veredicto del Analista Fundamental ---")
-    print(f"Activo: {simbolo_ejemplo}")
-    print(veredicto)
-    print("------------------------------------------")
+    agente = AgenteFundamental()
 
-    # Ejemplo con una acción que sí tiene noticias para probar la ruta principal
-    simbolo_ejemplo_2 = "GLOB"
-    veredicto_2 = agente.analizar_activo(simbolo_ejemplo_2)
-    print("\n--- Veredicto del Analista Fundamental ---")
-    print(f"Activo: {simbolo_ejemplo_2}")
-    print(veredicto_2)
-    print("------------------------------------------")
+    for simbolo in ["NVDA", "GGAL", "AL30"]:
+        print(f"\n{'='*50}")
+        print(f" Análisis fundamental: {simbolo}")
+        print("="*50)
+        resultado = agente.analizar_activo(simbolo)
+        print(resultado)
